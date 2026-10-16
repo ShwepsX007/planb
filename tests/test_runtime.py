@@ -5,7 +5,7 @@ import os
 
 import pytest
 
-from app.bot import STATUS_PAUSED, STATUS_RUNNING, STATUS_STOPPED, BotRuntime
+from app.bot import STATUS_ERROR, STATUS_PAUSED, STATUS_RUNNING, STATUS_STOPPED, BotRuntime
 from app.config import BotSettings
 from app.db import Database
 from app.models import Fill
@@ -80,6 +80,7 @@ async def test_startup_event_starts_bot_when_requested(tmp_path, monkeypatch):
     """Проверяем именно ту связку, что включает автозапуск в systemd."""
     from app.main import create_app
     monkeypatch.setenv("PLANB_PRESET", "synthetic")   # автономный запуск без интернета
+    monkeypatch.setenv("PLANB_AUTOSTART_DELAY", "0")
     db_path = os.path.join(str(tmp_path), "app.sqlite3")
     app = create_app(db_path)
     runtime = app.state.runtime
@@ -88,10 +89,69 @@ async def test_startup_event_starts_bot_when_requested(tmp_path, monkeypatch):
 
     for handler in app.router.on_startup:
         await handler()
+    await app.state.autostart_task            # автозапуск идёт фоном
 
     assert runtime.status in (STATUS_RUNNING, STATUS_PAUSED)
     assert runtime.engine.last_price > 0
     await runtime.stop()
+
+
+@pytest.mark.asyncio
+async def test_startup_does_not_wait_for_the_exchange(tmp_path, monkeypatch):
+    """Панель должна подниматься, даже если биржа «висит».
+
+    Регрессия: автозапуск выполнялся прямо в startup-обработчике, а uvicorn открывает
+    порт только после него — при медленной бирже панель вообще не открывалась
+    («служба активна, порт не слушается»).
+    """
+    import asyncio
+    from app.main import create_app
+    monkeypatch.delenv("PLANB_PRESET", raising=False)
+    monkeypatch.setenv("PLANB_AUTOSTART_DELAY", "0")
+    app = create_app(os.path.join(str(tmp_path), "hang.sqlite3"))
+    runtime = app.state.runtime
+    runtime.db.kv_set("desired_running", True)
+
+    async def hang(_settings=None):
+        await asyncio.sleep(3600)
+
+    monkeypatch.setattr(runtime, "start", hang)
+    for handler in app.router.on_startup:
+        await asyncio.wait_for(handler(), timeout=1.0)     # обработчик возвращается сразу
+
+    assert runtime.snapshot()["status"] == STATUS_STOPPED  # сервер уже отвечает панели
+    app.state.autostart_task.cancel()
+
+
+@pytest.mark.asyncio
+async def test_start_gives_up_on_slow_exchange(tmp_path, monkeypatch):
+    """Если биржа не отвечает, запуск завершается понятной ошибкой, а не висит вечно."""
+    import asyncio
+    runtime = make_runtime(tmp_path)
+    monkeypatch.setenv("PLANB_FEED_TIMEOUT", "1")
+
+    class SlowFeed:
+        real = False
+        label = "медленная биржа"
+        last_error = ""
+
+        async def history(self, limit=300):
+            await asyncio.sleep(30)
+            return []
+
+        async def close(self):
+            return None
+
+        def status(self):
+            return {"label": self.label, "real": False, "last_error": self.last_error,
+                    "last_ok_ts": 0, "last_candle_ts": 0}
+
+    monkeypatch.setattr("app.bot.make_feed", lambda *a, **kw: SlowFeed())
+    result = await asyncio.wait_for(runtime.start(runtime.settings), timeout=10)
+    assert result["ok"] is False
+    assert "не ответила" in result["error"]
+    assert runtime.status == STATUS_ERROR
+    assert any("не ответила" in log["message"] for log in runtime.logs)
 
 
 def test_demo_preset_uses_real_exchange_data(tmp_path, monkeypatch):

@@ -7,6 +7,7 @@ broadcasts snapshots to the web panel.
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 import uuid
 from collections import deque
@@ -159,8 +160,12 @@ class BotRuntime:
                     start_price=self.db.kv_get("demo_last_price") if self.settings.synthetic_data else None,
                 )
                 self.broker = make_broker(self.settings)
-                await self.broker.start()
-                history = await self.feed.history(self.settings.candle_lookback)
+                timeout = self._net_timeout()
+                await asyncio.wait_for(self.broker.start(), timeout=timeout)
+                # сетевые запросы к бирже ограничены по времени: иначе «зависшая»
+                # биржа оставляла бота и панель без ответа на неопределённый срок
+                history = await asyncio.wait_for(self.feed.history(self.settings.candle_lookback),
+                                                 timeout=timeout)
                 self._chart_candles = list(history)
                 # keep the engine history but do not re-run old signals
                 self.engine.set_history(history)
@@ -192,11 +197,29 @@ class BotRuntime:
                                      f"иначе бот остановится после первого цикла")
                 await self._reconcile(first=True)
                 return {"ok": True, "status": self.status}
-            except Exception as exc:
+            except asyncio.TimeoutError:
                 self.status = STATUS_ERROR
-                self.error = str(exc)
-                self.log("error", f"не удалось запустить бота: {exc}")
-                return {"ok": False, "error": str(exc)}
+                self.error = (f"биржа не ответила за {self._net_timeout():g} с — бот не запущен. "
+                              f"Проверьте доступ с сервера: "
+                              f"curl -s -m 10 https://api.gateio.ws/api/v4/spot/time")
+                self.log("error", self.error)
+                return {"ok": False, "error": self.error}
+            except Exception as exc:
+                # если источник данных умеет объяснить ошибку по-человечески
+                # (нет связи с биржей, гео-ограничение) — показываем её
+                friendly = (self.feed.last_error if self.feed is not None else "") or str(exc)
+                self.status = STATUS_ERROR
+                self.error = friendly
+                self.log("error", f"не удалось запустить бота: {friendly}")
+                return {"ok": False, "error": friendly}
+
+    @staticmethod
+    def _net_timeout() -> float:
+        """Сколько ждать биржу при запуске (секунды)."""
+        try:
+            return max(5.0, float(os.environ.get("PLANB_FEED_TIMEOUT", "45")))
+        except ValueError:
+            return 45.0
 
     async def _teardown(self) -> None:
         if self._task is not None:

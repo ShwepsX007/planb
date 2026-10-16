@@ -512,21 +512,46 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
 
     @app.on_event("startup")
     async def _startup():
-        """Автозапуск бота при старте процесса (systemd/Docker)."""
+        """Автозапуск бота — ТОЛЬКО в фоне, панель не должна ждать биржу.
+
+        uvicorn сначала выполняет startup-обработчики и лишь потом открывает порт.
+        Если автозапуск выполнялся здесь синхронно, а биржа отвечала медленно (или
+        запрос к ней «подвисал»), панель вообще не открывалась: служба в systemd
+        «активна», а порт никто не слушает. Поэтому запуск бота уходит в отдельную
+        задачу, а веб-сервер поднимается сразу.
+        """
+        app.state.autostart_task = asyncio.create_task(_autostart())
+        return None
+
+    async def _autostart() -> None:
+        try:
+            delay = float(os.environ.get("PLANB_AUTOSTART_DELAY", "1.0") or 0)
+        except ValueError:
+            delay = 1.0
+        if delay > 0:
+            await asyncio.sleep(delay)          # отдаём порт браузеру как можно раньше
         if not autostart_enabled():
             runtime.log("info", "автозапуск отключён (PLANB_AUTOSTART=0)", persist=False)
             return
-        if runtime.should_autostart():
-            result = await runtime.start(runtime.settings)
-            if not result.get("ok"):
-                runtime.log("error", f"автозапуск не удался: {result.get('error')}", persist=False)
-        elif runtime.engine.cycle is not None:
-            runtime.log("warn", "после запуска обнаружен незакрытый цикл, но бот был остановлен "
-                                "пользователем — нажмите «Продолжить», чтобы взять его в работу",
-                        persist=False)
+        try:
+            if runtime.should_autostart():
+                result = await runtime.start(runtime.settings)
+                if not result.get("ok"):
+                    runtime.log("error", f"автозапуск не удался: {result.get('error')}", persist=False)
+            elif runtime.engine.cycle is not None:
+                runtime.log("warn", "после запуска обнаружен незакрытый цикл, но бот был остановлен "
+                                    "пользователем — нажмите «Продолжить», чтобы взять его в работу",
+                            persist=False)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # автозапуск не должен ронять сервер
+            runtime.log("error", f"автозапуск не удался: {exc}", persist=False)
 
     @app.on_event("shutdown")
     async def _shutdown():
+        task = getattr(app.state, "autostart_task", None)
+        if task is not None and not task.done():
+            task.cancel()
         try:
             await runtime._teardown()  # noqa: SLF001
         except Exception:

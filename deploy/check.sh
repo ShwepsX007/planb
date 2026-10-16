@@ -21,6 +21,12 @@ note_problem() { PROBLEMS=$((PROBLEMS + 1)); bad "$*"; }
 head_ "1. Сервис systemd"
 if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
     ok "служба $SERVICE_NAME активна"
+    RESTARTS="$(systemctl show "$SERVICE_NAME" -p NRestarts --value 2>/dev/null | head -1 || true)"
+    [ -n "$RESTARTS" ] || RESTARTS="$(systemctl show "$SERVICE_NAME" -p NRestarts 2>/dev/null | cut -d= -f2)"
+    case "$RESTARTS" in ''|*[!0-9]*) RESTARTS=0 ;; esac
+    if [ -n "$RESTARTS" ] && [ "$RESTARTS" != "0" ]; then
+        info "служба перезапускалась $RESTARTS раз(а) — если порт ниже не слушается, смотрите причину в разделе 3"
+    fi
 else
     note_problem "служба $SERVICE_NAME не активна — смотрите: systemctl status $SERVICE_NAME; journalctl -u $SERVICE_NAME -n 50"
 fi
@@ -69,7 +75,32 @@ if ss -ltn 2>/dev/null | awk 'NR>1{print $4}' | grep -Eq "[:.]${PORT}\$"; then
         *) info "порт занят не нашим процессом — проверьте, что бот запущен" ;;
     esac
 else
-    note_problem "порт $PORT никто не слушает — бот не запущен (journalctl -u $SERVICE_NAME -n 50)"
+    if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
+        note_problem "служба $SERVICE_NAME активна, но порт $PORT не слушается — процесс не смог запуститься"
+    else
+        note_problem "порт $PORT никто не слушает — бот не запущен"
+    fi
+    # сразу показываем причину: последние строки журнала, счётчик перезапусков и
+    # самопроверку кода — чтобы не гадать, почему сервис молчит
+    info "последние события службы (journalctl):"
+    journalctl -u "$SERVICE_NAME" -n 25 --no-pager 2>/dev/null | sed 's/^/        /' \
+        || info " journalctl недоступен"
+    SHOW="$(systemctl show "$SERVICE_NAME" -p NRestarts -p Result -p ExecMainStatus -p ActiveState -p SubState 2>/dev/null | tr '\n' ' ')"
+    [ -n "$SHOW" ] && info "systemd: $SHOW"
+    if [ -x "$PLANB_DIR/.venv/bin/python" ]; then
+        if IMPORT_OUT="$(cd "$PLANB_DIR" && timeout 60 ./.venv/bin/python -c 'import app.main; print("импорт кода ок")' 2>&1)"; then
+            info "код бота импортируется без ошибок ($IMPORT_OUT)"
+            info "если в журнале выше видно 'биржа не ответила' — это таймаут сети, бот просто не стартовал"
+        else
+            note_problem "код бота не импортируется — ошибка в самом приложении:"
+            printf '%s\n' "$IMPORT_OUT" | tail -12 | sed 's/^/        /'
+            info "лечение:  cd $PLANB_DIR && git pull && .venv/bin/pip install -r requirements.txt"
+        fi
+    else
+        info "нет $PLANB_DIR/.venv/bin/python — окружение не создано (переустановите: bash deploy/install.sh)"
+    fi
+    info "перезапустить:  systemctl restart $SERVICE_NAME    (после перезапуска подождите 5-10 секунд)"
+    info "смотреть живьём: journalctl -u $SERVICE_NAME -f"
 fi
 
 # --------------------------------------------------------------- 4. локально

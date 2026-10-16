@@ -87,8 +87,14 @@ class GateFeed(BaseFeed):
 
     async def _client(self) -> ccxt.Exchange:
         if self.ex is None:
-            options = {"defaultType": "swap" if self.settings.market_type == "futures" else "spot"}
-            self.ex = ccxt.gate({"enableRateLimit": True, "timeout": 20000, "options": options})
+            futures = self.settings.market_type == "futures"
+            options = {
+                "defaultType": "swap" if futures else "spot",
+                # грузим только нужный тип рынка: полный список Gate.io включает опционы
+                # и маржинальные пары и отвечает заметно дольше (а иногда и подвисает)
+                "fetchMarkets": {"types": ["swap"] if futures else ["spot"]},
+            }
+            self.ex = ccxt.gate({"enableRateLimit": True, "timeout": 15000, "options": options})
             if self.settings.sandbox:
                 try:
                     self.ex.set_sandbox_mode(True)
@@ -290,13 +296,26 @@ def make_feed(settings: BotSettings, *, start_price: Optional[float] = None) -> 
 
 
 def _friendly_error(exc: BaseException) -> str:
-    """Человеческое объяснение сетевой ошибки биржи."""
-    text = str(exc) or exc.__class__.__name__
+    """Человеческое объяснение сетевой ошибки биржи.
+
+    ccxt часто кладёт причину в отдельное исключение (``__cause__``), а в тексте
+    остаётся только адрес запроса — поэтому разворачиваем всю цепочку.
+    """
+    parts: List[str] = []
+    cur: Optional[BaseException] = exc
+    for _ in range(5):
+        if cur is None:
+            break
+        text = str(cur).strip()
+        parts.append(f"{cur.__class__.__name__}: {text}" if text else cur.__class__.__name__)
+        cur = cur.__cause__ or cur.__context__
+    text = " | ".join(parts) or "неизвестная ошибка"
     low = text.lower()
     if "451" in low or "restricted" in low or "forbidden" in low or "region" in low:
         return (f"биржа недоступна с этого сервера (гео-ограничение): {text}")
     if any(k in low for k in ("timed out", "timeout", "connection", "network", "dns",
-                              "resolve", "unreachable", "ssl", "handshake")):
+                              "resolve", "unreachable", "ssl", "handshake", "getaddrinfo",
+                              "notavailable", "errno -", "temporary failure")):
         return (f"нет связи с биржей Gate.io: {text}. Проверьте интернет на сервере: "
                 f"curl -s -m 10 'https://api.gateio.ws/api/v4/spot/time'")
     return text
