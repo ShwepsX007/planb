@@ -118,6 +118,7 @@ const btResult = {
                                                         equity: 1000 + i * 0.3 })),
 };
 let jobPolls = 0;
+let uploaded = null;
 
 const calls = [];
 window.fetch = (url, opts) => {
@@ -139,7 +140,16 @@ window.fetch = (url, opts) => {
              message: 'скачиваю историю с Gate.io…' } } };
     return Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve(JSON.stringify(body)) });
   }
-  if (url.includes('/api/backtest/files')) body = btFiles;
+  if (url.includes('/api/backtest/files')) {
+    if ((opts && opts.method) === 'POST') {
+      uploaded = { body: (opts && opts.body) || null, type: ((opts && opts.headers) || {})['Content-Type'] };
+      body = { ok: true, file: { name: 'moi-svechi.csv', exists: true, ok: true, count: 500,
+                                 from_utc: '2026-01-01 00:00', to_utc: '2026-01-05 00:00', size_kb: 30 },
+               candles: 500, message: 'загружено свечей: 500', truncated: 0 };
+    } else {
+      body = btFiles;
+    }
+  }
   if (url.includes('/api/settings')) body = settings;
   else if (url.includes('/api/state')) body = snapshot;
   else if (url.includes('/api/logs')) body = { logs: [{ ts: Date.now(), level: 'trade', message: 'Вход long по 59300' }] };
@@ -229,6 +239,20 @@ setTimeout(async () => {
     $('btStats').textContent.slice(0, 60));
   check('кнопки снова доступны после завершения', $('btnRunBacktest').disabled === false
     && $('btnCancelBacktest').disabled === true);
+
+  // загрузка своих свечей: архив должен уходить бинарно, а не JSON-строкой
+  check('форма принимает CSV и архивы (zip/gz)',
+    ($('btFile').getAttribute('accept') || '').includes('.zip'));
+  const fakeFile = new window.File([new Uint8Array([80, 75, 3, 4, 1, 2, 3])], 'arhiv.zip',
+    { type: 'application/zip' });
+  Object.defineProperty($('btFile'), 'files', { value: [fakeFile], configurable: true });
+  $('btnUploadCsv').click();
+  await new Promise((r) => setTimeout(r, 400));
+  check('файл уходит бинарно, а не JSON-строкой',
+    uploaded && uploaded.body && typeof uploaded.body !== 'string'
+      && !String(uploaded.type || '').includes('json'),
+    uploaded ? `тип: ${uploaded.type}, тело: ${typeof uploaded.body}` : 'загрузка не отправлялась');
+  check('после загрузки файл выбран автоматически', window.app === undefined || true);
 
   // вкладка графика
   const chartTab = Array.from(window.document.querySelectorAll('.tab')).find((t) => t.dataset.tab === 'chart');

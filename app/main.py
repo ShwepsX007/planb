@@ -19,8 +19,8 @@ from .brokers.gate import test_credentials
 from .config import DEFAULT_SETTINGS, BotSettings
 from .db import Database
 from .feed import check_gate_connection
-from .history import (HistoryError, describe as describe_candles, delete_file, file_info,
-                      list_files, read_csv, save_file)
+from .history import (MAX_CANDLES, HistoryError, describe as describe_candles, delete_file,
+                      file_info, list_files, read_candles, save_file, write_csv)
 
 ROOT = Path(__file__).resolve().parent.parent
 WEB_DIR = ROOT / "web"
@@ -441,18 +441,41 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
 
     @app.post("/api/backtest/files")
     async def backtest_file_upload(request: Request,
-                                   name: str = Query(default="candles.csv", max_length=120)):
-        """Загрузить свои свечи (CSV в теле запроса, текст)."""
-        raw = (await request.body()).decode("utf-8", errors="replace")
+                                   name: str = Query(default="candles.csv", max_length=160)):
+        """Загрузить свои свечи: CSV, ZIP или GZIP — как есть, без распаковки руками.
+
+        Понимает выгрузки бирж (Binance, Gate.io, TradingView, Excel): разделитель
+        «,» или «;», время в секундах/миллисекундах/микросекундах/датой, лишние
+        колонки игнорируются. Файл нормализуется и сохраняется в data/candles как CSV.
+        """
+        import json as _json
+        import re as _re
+        raw = await request.body()
+        if not raw:
+            return JSONResponse(status_code=400, content={"ok": False, "error": "пустой файл"})
+        # прежняя версия панели отправляла CSV в JSON-строке — принимаем и такой формат
+        if raw[:1] == b'"' and raw[-1:] == b'"':
+            try:
+                raw = _json.loads(raw.decode("utf-8")).encode("utf-8")
+            except Exception:
+                pass
         try:
-            candles = read_csv(raw)
+            candles = read_candles(raw)
         except HistoryError as exc:
             return JSONResponse(status_code=400, content={"ok": False, "error": str(exc)})
-        from .history import file_path
-        path = save_file(name, raw)
+        truncated = 0
+        if len(candles) > MAX_CANDLES:
+            truncated = len(candles) - MAX_CANDLES
+            candles = candles[-MAX_CANDLES:]      # берём последние свечи — они нужнее
+        clean = _re.sub(r"\.(zip|gz|csv|txt)$", "", name, flags=_re.I).strip() or "candles"
+        path = save_file(clean + ".csv", write_csv(candles))
         info = {"name": path.name, "label": f"файл {path.name}"}
         info.update(describe_candles(candles))
-        return {"ok": True, "file": file_info(path.name), "candles": len(candles), "data": info}
+        message = f"загружено свечей: {len(candles)}"
+        if truncated:
+            message += f" (лимит {MAX_CANDLES}, отброшено старых свечей: {truncated})"
+        return {"ok": True, "file": file_info(path.name), "candles": len(candles),
+                "data": info, "message": message, "truncated": truncated}
 
     @app.get("/api/backtest/files/{name}")
     async def backtest_file_download(name: str):

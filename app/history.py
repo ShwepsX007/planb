@@ -63,7 +63,16 @@ def _translit(text: str) -> str:
              "п": "p", "р": "r", "с": "s", "т": "t", "у": "u", "ф": "f", "х": "h", "ц": "c",
              "ч": "ch", "ш": "sh", "щ": "sch", "ъ": "", "ы": "y", "ь": "", "э": "e", "ю": "yu",
              "я": "ya"}
-    return "".join(table.get(ch, ch) for ch in text.lower())
+    out: List[str] = []
+    for ch in text:
+        mapped = table.get(ch.lower())
+        if mapped is None:
+            out.append(ch)
+        elif ch.isupper() and len(mapped) == 1:
+            out.append(mapped.upper())       # BTCUSDT остаётся BTCUSDT, а не btcusdt
+        else:
+            out.append(mapped)
+    return "".join(out)
 
 
 def safe_filename(name: str) -> str:
@@ -123,11 +132,27 @@ def parse_time_ms(value: Any) -> Optional[int]:
     text = str(value).strip()
     if not text:
         return None
-    if re.fullmatch(r"\d{10,13}", text):
+    if re.fullmatch(r"\d+", text):
         number = int(text)
-        return number * 1000 if number < 10**11 else number
-    if re.fullmatch(r"\d+(\.\d+)?", text):
+        # 10-11 знаков — секунды, 12-14 — миллисекунды, 15-17 — микросекунды
+        # (так пишет Binance в своих выгрузках), 18+ — наносекунды
+        if number < 10**11:
+            return number * 1000
+        if number < 10**14:
+            return number
+        if number < 10**17:
+            return number // 1000
+        return number // 1_000_000
+    if re.fullmatch(r"\d+\.\d+", text):
         return parse_time_ms(float(text))
+    # ISO-дата: 2026-01-01T00:00:00Z, 2026-01-01 00:00:00.123456+03:00 и т.п.
+    try:
+        parsed = dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=dt.timezone.utc)
+        return int(parsed.timestamp() * 1000)
+    except ValueError:
+        pass
     formats = ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M",
                "%Y-%m-%d", "%d.%m.%Y %H:%M:%S", "%d.%m.%Y %H:%M", "%d.%m.%Y", "%d/%m/%Y")
     for fmt in formats:
@@ -171,14 +196,24 @@ def normalize_symbol(symbol: str, market_type: str) -> str:
 ProgressFn = Callable[[int, Optional[int], str], None]
 
 
+#: Gate.io отдаёт по фьючерсам только последние ~10 000 свечей
+#: ("Candlestick too long ago. Maximum 10000 points recently are allowed")
+FUTURES_HISTORY_POINTS = 10_000
+
+
 async def download_candles(settings: BotSettings, req: HistoryRequest,
-                           progress: Optional[ProgressFn] = None) -> List[Candle]:
+                           progress: Optional[ProgressFn] = None,
+                           warnings: Optional[List[str]] = None) -> List[Candle]:
     """Скачать закрытые свечи с Gate.io (публичный API, ключи не нужны).
 
     Страницами по ``PAGE_LIMIT`` свечей; ``progress(получено, всего, текст)``
     вызывается после каждой страницы — панель показывает ход загрузки.
     """
     import ccxt.async_support as ccxt  # импорт внутри, чтобы модуль читался без сети
+
+    def warn(message: str) -> None:
+        if warnings is not None and message not in warnings:
+            warnings.append(message)
 
     if req.timeframe not in TIMEFRAMES:
         raise HistoryError(f"неизвестный таймфрейм «{req.timeframe}»")
@@ -191,6 +226,16 @@ async def download_candles(settings: BotSettings, req: HistoryRequest,
         raise HistoryError(
             f"получится {total:,} свечей — это больше лимита {MAX_CANDLES:,}. "
             f"Возьмите таймфрейм крупнее или период короче".replace(",", " "))
+    # у фьючерсов Gate.io нет глубокой истории: биржа отдаёт ~10 000 последних свечей.
+    # Обрезаем запрос сами и объясняем это пользователю, а не ждём ошибку биржи.
+    if req.market_type == "futures":
+        earliest = until - FUTURES_HISTORY_POINTS * tf_ms
+        if start is not None and start < earliest:
+            warn(f"фьючерсы Gate.io: биржа отдаёт только последние ~{FUTURES_HISTORY_POINTS:,} свечей "
+                 f"({req.timeframe}) — история начнётся с {_fmt_ts(earliest)} UTC. "
+                 f"Для более длинного периода возьмите спот или таймфрейм крупнее.".replace(",", " "))
+            start = earliest
+
     if start is None:
         limit = int(req.limit or 3000)
         if limit > MAX_CANDLES:
@@ -219,6 +264,15 @@ async def download_candles(settings: BotSettings, req: HistoryRequest,
             try:
                 rows = await ex.fetch_ohlcv(symbol, req.timeframe, since=since, limit=PAGE_LIMIT)
             except Exception as exc:
+                text = str(exc).lower()
+                if "too long ago" in text or "10000 point" in text or "10_000" in text:
+                    message = ("биржа не отдаёт историю дальше ~10 000 последних свечей "
+                               "(ограничение Gate.io для фьючерсов) — возьмите спот, "
+                               "таймфрейм крупнее или период короче")
+                    if not out:
+                        raise HistoryError(message) from exc
+                    warn(message + f"; использована доступная часть с {_fmt_ts(out[0].ts)} UTC")
+                    break
                 if out:
                     break          # часть данных уже есть — не теряем её
                 raise HistoryError(f"биржа не отдала историю: {exc}") from exc
@@ -251,6 +305,11 @@ async def download_candles(settings: BotSettings, req: HistoryRequest,
             pass
 
     candles = dedupe(out)
+    if candles and req.date_from:
+        asked = parse_time_ms(req.date_from)
+        if asked and candles[0].ts - asked > TIMEFRAMES[req.timeframe] * 1000 * 2:
+            warn(f"биржа отдала историю начиная с {_fmt_ts(candles[0].ts)} UTC, "
+                 f"хотя запрошено с {_fmt_ts(asked)} UTC — глубже данных нет")
     if start and not req.date_from:
         candles = candles[-int(req.limit or len(candles)):]
     if total and not req.date_from:
@@ -274,13 +333,16 @@ def dedupe(candles: Iterable[Candle]) -> List[Candle]:
 # ------------------------------------------------------------------ CSV
 _HEADER_ALIASES = {
     "time": "ts", "ts": "ts", "timestamp": "ts", "date": "ts", "datetime": "ts", "unix": "ts",
-    "время": "ts", "дата": "ts", "time_open": "ts", "opentime": "ts",
+    "время": "ts", "дата": "ts", "time_open": "ts", "time open": "ts", "opentime": "ts",
+    "open_time": "ts", "open time": "ts", "start_time": "ts", "starttime": "ts",
+    "candle_time": "ts", "unix_time": "ts", "время открытия": "ts",
     "open": "open", "откр": "open", "открытие": "open",
     "high": "high", "макс": "high", "максимум": "high",
     "low": "low", "мин": "low", "минимум": "low",
     "close": "close", "закр": "close", "закрытие": "close", "цена": "close", "price": "close",
     "volume": "volume", "vol": "volume", "объем": "volume", "объём": "volume",
-    "basevolume": "volume", "quotevolume": "quote_volume",
+    "basevolume": "volume", "base_volume": "volume", "quotevolume": "quote_volume",
+    "quote_volume": "quote_volume",
 }
 _REQUIRED = ("ts", "open", "high", "low", "close")
 
@@ -296,6 +358,47 @@ def _to_float(text: str, *, decimal_comma: bool = False) -> float:
     if decimal_comma and "," in text and "." not in text:
         text = text.replace(",", ".")
     return float(text)
+
+
+#: сигнатуры архивов с выгрузками свечей (месячные архивы бирж)
+ZIP_MAGIC = b"PK\x03\x04"
+GZIP_MAGIC = b"\x1f\x8b"
+
+
+def read_candles(blob: "bytes | str") -> List[Candle]:
+    """Свечи из текста CSV ИЛИ из архива (ZIP/GZIP) с CSV внутри.
+
+    Месячные выгрузки бирж (например Binance) отдаются именно архивами — их можно
+    загружать в панель как есть, распаковывать руками не нужно.
+    """
+    if isinstance(blob, str):
+        return read_csv(blob)
+    data = bytes(blob)
+    if data[:4] == ZIP_MAGIC:
+        return read_csv(_csv_from_zip(data))
+    if data[:2] == GZIP_MAGIC:
+        import gzip
+        try:
+            return read_csv(gzip.decompress(data).decode("utf-8", errors="replace"))
+        except OSError as exc:
+            raise HistoryError(f"не удалось распаковать gzip-файл: {exc}") from exc
+    return read_csv(data.decode("utf-8", errors="replace"))
+
+
+def _csv_from_zip(data: bytes) -> str:
+    """Достать CSV из ZIP-архива (берём самый большой подходящий файл)."""
+    import zipfile
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            names = [n for n in zf.namelist() if not n.endswith("/")]
+            if not names:
+                raise HistoryError("архив пустой")
+            csv_like = [n for n in names if n.lower().endswith((".csv", ".txt"))] or names
+            csv_like.sort(key=lambda n: zf.getinfo(n).file_size, reverse=True)
+            with zf.open(csv_like[0]) as fh:
+                return fh.read().decode("utf-8", errors="replace")
+    except zipfile.BadZipFile as exc:
+        raise HistoryError(f"файл не похож на ZIP-архив: {exc}") from exc
 
 
 def read_csv(text: str) -> List[Candle]:

@@ -659,7 +659,8 @@ class BotRuntime:
 
         job["progress"] = {"candles": 0, "total": None, "percent": None,
                            "message": "скачиваю историю с Gate.io…"}
-        candles = await download_candles(bt_settings, req, progress=progress)
+        warnings: List[str] = []
+        candles = await download_candles(bt_settings, req, progress=progress, warnings=warnings)
         name = downloaded_filename(req)
         try:
             save_file(name, write_csv(candles))
@@ -669,6 +670,8 @@ class BotRuntime:
                 "label": f"история Gate.io {req.symbol} {req.timeframe}",
                 "symbol": req.symbol, "market_type": req.market_type}
         info.update(describe_candles(candles, req.timeframe))
+        if warnings:
+            info["warnings"] = warnings
         return candles, info
 
     def _new_backtest_job(self, params: Dict[str, Any]) -> Dict[str, Any]:
@@ -755,6 +758,8 @@ class BotRuntime:
             self.log("info", f"Бэктест готов: {info.get('label', req.source)}, "
                              f"свечей {len(candles)}, циклов {result.get('cycles', 0)}, "
                              f"профит {result.get('total_pnl', 0):+.4f}$", persist=False)
+            for warning in info.get("warnings", []):
+                self.log("warn", f"бэктест: {warning}", persist=False)
         except asyncio.CancelledError:
             job["state"] = "cancelled"
             job["error"] = "загрузка остановлена пользователем"

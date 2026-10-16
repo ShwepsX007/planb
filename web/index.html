@@ -204,13 +204,15 @@
           <div class="bt-form" id="btForm"></div>
         </div>
         <div class="bt-source">
-          <h3>2. Или свои свечи (CSV)</h3>
-          <p class="muted">Подойдёт любой CSV с колонками <code>ts,open,high,low,close,volume</code>:
-          выгрузка Gate.io, TradingView, Excel (разделитель «,» или «;», время секундами,
-          миллисекундами или датой). Загруженный файл остаётся на сервере — его можно
-          прогонять повторно с другими параметрами.</p>
+          <h3>2. Или свои свечи (CSV / ZIP-архив)</h3>
+          <p class="muted">Подойдёт любой файл со свечами: <b>CSV</b> с колонками
+          <code>ts,open,high,low,close,volume</code> (выгрузка Gate.io, TradingView, Excel)
+          или <b>ZIP/GZIP-архив</b> с CSV внутри — например месячные выгрузки Binance
+          с <code>data.binance.vision</code>: их можно не распаковывать. Понимаем разделитель
+          «,» и «;», время секундами, миллисекундами, микросекундами или датой, лишние колонки
+          игнорируем. Файл остаётся на сервере и годится для повторных прогонов.</p>
           <div class="row">
-            <input type="file" id="btFile" accept=".csv,.txt,text/csv">
+            <input type="file" id="btFile" accept=".csv,.txt,.zip,.gz,text/csv,application/zip,application/gzip">
             <button class="btn btn-small" id="btnUploadCsv">Загрузить на сервер</button>
           </div>
           <div id="btFiles" class="bt-files"></div>

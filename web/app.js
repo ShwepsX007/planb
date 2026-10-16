@@ -687,14 +687,27 @@ async function loadBtFiles() {
 async function uploadBtCsv() {
   const input = $('btFile');
   const file = input && input.files && input.files[0];
-  if (!file) { toast('Выберите CSV-файл', 'err'); return; }
-  const text = await file.text();
+  if (!file) { toast('Выберите файл со свечами (CSV или ZIP)', 'err'); return; }
+  const url = BASE + `api/backtest/files?name=${encodeURIComponent(file.name)}`;
+  $('btStatus').textContent = `загружаю ${file.name}…`;
   try {
-    const res = await api('POST', `/api/backtest/files?name=${encodeURIComponent(file.name)}`, text);
-    app.btFile = res.file.name;
-    toast(`Загружено: ${res.file.name} (${res.candles} свечей)`);
+    // отправляем файл как есть (бинарно): сервер сам распознает CSV, ZIP или GZIP
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': file.type || 'application/octet-stream' },
+      body: await file.arrayBuffer(),
+      credentials: 'same-origin',
+    });
+    const data = await res.json().catch(() => null);
+    if (!res.ok || !data || !data.ok) {
+      throw new Error((data && data.error) || ('HTTP ' + res.status));
+    }
+    app.btFile = data.file.name;
+    toast(`Загружено: ${data.file.name} — ${data.candles} свечей`);
+    $('btStatus').textContent = data.message || `загружено свечей: ${data.candles}`;
     loadBtFiles();
   } catch (e) {
+    $('btStatus').textContent = '';
     toast('Файл не принят: ' + e.message, 'err');
   }
 }
@@ -796,6 +809,12 @@ function renderBacktestResult(r) {
     <div class="card-value">${v}</div><div class="card-hint">${h}</div></div>`).join('');
 
   const d = r.data || {};
+  const warnBox = $('btHint');
+  if (warnBox) {
+    const warnings = d.warnings || [];
+    warnBox.className = 'hint-banner ' + (warnings.length ? 'warn' : 'hidden');
+    warnBox.innerHTML = warnings.map((w) => '⚠ ' + escapeHtml(w)).join('<br>');
+  }
   const info = $('btDataInfo');
   if (info) {
     const real = d.source === 'gate';

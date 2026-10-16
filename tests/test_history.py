@@ -10,7 +10,7 @@ import pytest
 from app.config import BotSettings
 from app.history import (HistoryError, HistoryRequest, dedupe, describe, downloaded_filename,
                          estimate_candles, file_info, list_files, normalize_symbol, parse_time_ms,
-                         read_csv, safe_filename, write_csv, file_path)
+                         read_candles, read_csv, safe_filename, write_csv, file_path)
 from app.models import Candle, now_ms
 
 
@@ -41,10 +41,12 @@ def make_candles(count: int, *, tf_ms: int = 300_000, step: float = 0.1, end_ts:
 class FakeExchange:
     """Мини-двойник ccxt: отдаёт историю страницами, как настоящая биржа."""
 
-    def __init__(self, candles, page: int = 1000, fail_after: int | None = None):
+    def __init__(self, candles, page: int = 1000, fail_after: int | None = None,
+                 fail_message: str = "connection reset by peer"):
         self.candles = list(candles)
         self.page = page
         self.fail_after = fail_after
+        self.fail_message = fail_message
         self.calls: list[dict] = []
         self.closed = False
         self.markets = {"BTC/USDT:USDT": {"id": "BTC_USDT"}, "BTC/USDT": {"id": "BTC_USDT"}}
@@ -55,7 +57,7 @@ class FakeExchange:
     async def fetch_ohlcv(self, symbol, timeframe, since=None, limit=1000):
         self.calls.append({"symbol": symbol, "timeframe": timeframe, "since": since, "limit": limit})
         if self.fail_after is not None and len(self.calls) > self.fail_after:
-            raise RuntimeError("connection reset by peer")
+            raise RuntimeError(self.fail_message)
         rows = [c for c in self.candles if c.ts >= (since or 0)]
         rows = rows[: min(limit, self.page)]
         return [c.to_list() for c in rows]
@@ -71,8 +73,9 @@ def fake_ccxt(monkeypatch):
 
     created: list[FakeExchange] = []
 
-    def install(candles, page: int = 1000, fail_after: int | None = None) -> FakeExchange:
-        ex = FakeExchange(candles, page=page, fail_after=fail_after)
+    def install(candles, page: int = 1000, fail_after: int | None = None,
+                fail_message: str = "connection reset by peer") -> FakeExchange:
+        ex = FakeExchange(candles, page=page, fail_after=fail_after, fail_message=fail_message)
         created.append(ex)
 
         def factory(_config):
@@ -393,3 +396,100 @@ async def test_live_trading_on_synthetic_data_is_rejected(client: httpx.AsyncCli
     ok = await client.put("/api/settings", json={"data_source": "synthetic", "trade_mode": "paper"})
     assert ok.status_code == 200
     assert ok.json()["settings"]["data_source"] == "synthetic"
+
+
+# --------------------------------------------- выгрузки бирж: архивы и микросекунды
+BINANCE_CSV = ("open_time,open,high,low,close,volume,close_time,quote_volume,count,"
+               "taker_buy_volume,taker_buy_quote_volume,ignore\n"
+               + "".join(f"{1700000000000000 + i * 60000000},60000,60100,59900,60050,12.5,"
+                         f"{1700000059999999 + i * 60000000},750000,100,5,300000,0\n"
+                         for i in range(120)))
+
+
+def test_parse_time_ms_accepts_microseconds_and_iso_fractions():
+    assert parse_time_ms("1700000000000000") == 1_700_000_000_000        # микросекунды
+    assert parse_time_ms("1700000000000000000") == 1_700_000_000_000     # наносекунды
+    assert parse_time_ms("2026-01-01T00:05:00.500Z") == 1_767_225_900_500
+    assert parse_time_ms("2026-01-01T00:05:00+03:00") == parse_time_ms("2025-12-31T21:05:00Z")
+
+
+def test_read_csv_binance_export_with_microseconds():
+    candles = read_csv(BINANCE_CSV)
+    assert len(candles) == 120
+    assert candles[0].ts == 1_700_000_000_000
+    assert candles[1].ts - candles[0].ts == 60_000
+    assert candles[0].close == 60050.0
+
+
+def test_read_candles_understands_zip_and_gzip():
+    import gzip
+    import io
+    import zipfile
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("BTCUSDT-1m-2026-01.csv", BINANCE_CSV)
+    assert len(read_candles(buf.getvalue())) == 120
+    assert len(read_candles(gzip.compress(BINANCE_CSV.encode()))) == 120
+    assert len(read_candles(BINANCE_CSV)) == 120
+    with pytest.raises(HistoryError):
+        read_candles("\x00\x01\x02 мусор".encode())
+
+
+async def test_futures_history_limit_is_explained(monkeypatch):
+    """У фьючерсов Gate.io нет глубокой истории — предупреждаем, а не падаем."""
+    tf_ms = 300_000
+    ex = FakeExchange(make_candles(30_000, tf_ms=tf_ms))
+    monkeypatch.setattr("ccxt.async_support.gate", lambda _cfg: ex)
+    from app.history import download_candles
+    req = HistoryRequest(symbol="BTC/USDT", market_type="futures", timeframe="5m",
+                         date_from="2026-06-01", date_to=None)
+    warnings: list[str] = []
+    candles = await download_candles(settings(market_type="futures"), req, warnings=warnings)
+    assert 9_000 <= len(candles) <= 10_000
+    assert warnings and "10 000" in warnings[0] and "спот" in warnings[0]
+
+
+async def test_futures_limit_error_from_exchange_is_readable(monkeypatch):
+    ex = FakeExchange([], fail_after=0,
+                      fail_message="gateio Candlestick too long ago. Maximum 10000 points recently are allowed")
+    monkeypatch.setattr("ccxt.async_support.gate", lambda _cfg: ex)
+    from app.history import download_candles
+    with pytest.raises(HistoryError) as err:
+        await download_candles(settings(market_type="futures"),
+                               HistoryRequest(symbol="BTC/USDT", market_type="futures",
+                                              timeframe="5m", limit=500))
+    assert "10 000" in str(err.value) and "спот" in str(err.value)
+
+
+async def test_upload_zip_archive_via_api(client: httpx.AsyncClient, tmp_path, monkeypatch):
+    import io
+    import zipfile
+    monkeypatch.setenv("PLANB_DATA_DIR", str(tmp_path))
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("BTCUSDT-1m-2026-01.csv", BINANCE_CSV)
+    res = await client.post("/api/backtest/files?name=BTCUSDT-1m-2026-01.zip", content=buf.getvalue(),
+                            headers={"Content-Type": "application/zip"})
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["ok"] and body["candles"] == 120
+    assert body["file"]["name"] == "BTCUSDT-1m-2026-01.csv"
+    assert "загружено свечей: 120" in body["message"]
+    # нормализованный файл можно скачать и прогнать бэктестом
+    saved = body["file"]["name"]
+    assert "ts,datetime_utc" in (await client.get(f"/api/backtest/files/{saved}")).text
+
+
+async def test_upload_accepts_old_json_wrapped_body_and_truncates_huge_files(
+        client: httpx.AsyncClient, tmp_path, monkeypatch):
+    import json as _json
+    monkeypatch.setenv("PLANB_DATA_DIR", str(tmp_path))
+    wrapped = _json.dumps(BINANCE_CSV[:2000])          # так отправляла прежняя версия панели
+    res = await client.post("/api/backtest/files?name=old-panel.csv", content=wrapped.encode())
+    assert res.status_code == 200 and res.json()["candles"] > 0
+
+    monkeypatch.setattr("app.main.MAX_CANDLES", 50)
+    res2 = await client.post("/api/backtest/files?name=many.csv", content=BINANCE_CSV.encode())
+    body = res2.json()
+    assert body["candles"] == 50 and body["truncated"] == 70
+    assert "отброшено" in body["message"]
