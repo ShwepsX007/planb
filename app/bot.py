@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+import uuid
 from collections import deque
 from typing import Any, Callable, Deque, Dict, List, Optional
 
@@ -19,6 +20,8 @@ from .config import BotSettings
 from .db import Database
 from .feed import BaseFeed, make_feed
 from .fib import fib_grid
+from .history import (HistoryRequest, describe as describe_candles, download_candles,
+                      downloaded_filename, read_csv, save_file, write_csv)
 from .models import Action, Candle, Fill, now_ms
 from .strategy import StrategyEngine
 
@@ -52,6 +55,9 @@ class BotRuntime:
         self._lock = asyncio.Lock()
         self._chart_candles: List[Candle] = []
         self._last_status_log = 0.0
+        #: фоновые задания бэктеста (загрузка истории — долгая операция)
+        self.backtest_jobs: Dict[str, Dict[str, Any]] = {}
+        self._backtest_tasks: Dict[str, asyncio.Task] = {}
         self._load_state()
 
     # ------------------------------------------------------------------ state
@@ -150,7 +156,7 @@ class BotRuntime:
                 await self._teardown()
                 self.feed = make_feed(
                     self.settings,
-                    start_price=self.db.kv_get("demo_last_price") if self.settings.data_source == "demo" else None,
+                    start_price=self.db.kv_get("demo_last_price") if self.settings.synthetic_data else None,
                 )
                 self.broker = make_broker(self.settings)
                 await self.broker.start()
@@ -167,8 +173,10 @@ class BotRuntime:
                 self.started_at = now_ms()
                 self._stop_evt = asyncio.Event()
                 self._task = asyncio.create_task(self._run_loop())
-                mode = "LIVE" if self.settings.trade_mode == "live" and self.settings.data_source == "gate" else "PAPER"
-                self.log("info", f"Бот запущен ({mode}, {self.settings.symbol}, "
+                mode = "LIVE" if self.settings.trade_mode == "live" else "PAPER"
+                money_label = ("РЕАЛЬНЫЕ ДЕНЬГИ" if mode == "LIVE" else "виртуальные сделки")
+                self.log("info", f"Бот запущен ({mode} — {money_label}, "
+                                 f"{self.settings.data_source_label()}, {self.settings.symbol}, "
                                  f"{self.settings.timeframe}, свечей {self.settings.candles_count}, "
                                  f"мин. движение {self.settings.min_move_pct:g}%, "
                                  f"цель фибо {self.settings.fib_goal_pct:g}%, "
@@ -385,7 +393,7 @@ class BotRuntime:
             pass
 
     async def _refresh_account(self) -> None:
-        if self.settings.data_source == "demo" and self.engine.last_price > 0:
+        if self.settings.synthetic_data and self.engine.last_price > 0:
             # чтобы демо-рынок не «прыгал» после перезапуска
             self.db.kv_set("demo_last_price", self.engine.last_price)
         if self.broker is None:
@@ -499,6 +507,9 @@ class BotRuntime:
             "paused": self.paused,
             "trade_mode": self.settings.trade_mode,
             "data_source": self.settings.data_source,
+            "data_source_label": self.settings.data_source_label(),
+            "data_real": bool(self.feed.real) if self.feed is not None else not self.settings.synthetic_data,
+            "feed": self.feed.status() if self.feed is not None else None,
             "symbol": self.settings.symbol,
             "timeframe": self.settings.timeframe,
             "market_type": self.settings.market_type,
@@ -559,57 +570,178 @@ class BotRuntime:
         }
 
     # --------------------------------------------------------------- backtests
-    async def run_backtest(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Run a backtest on historical data (Gate) or on synthetic candles (demo)."""
+    def _backtest_settings(self, params: Dict[str, Any]) -> BotSettings:
         merged = self.settings.model_dump()
         for key, value in (params or {}).items():
             if key in merged and value is not None:
                 merged[key] = value
-        bt_settings = BotSettings(**merged)
-        limit = int(params.get("limit_candles") or 3000)
-        limit = max(200, min(limit, 20000))
-        candles: List[Candle] = []
-        if bt_settings.data_source == "demo" or params.get("source") == "demo":
+        return BotSettings(**merged)
+
+    def _backtest_request(self, bt_settings: BotSettings, params: Dict[str, Any]) -> HistoryRequest:
+        source = str(params.get("source") or "").strip().lower()
+        aliases = {"": "synthetic" if bt_settings.synthetic_data else "gate",
+                   "demo": "synthetic", "synthetic": "synthetic", "synth": "synthetic",
+                   "gate": "gate", "exchange": "gate", "real": "gate", "market": "gate",
+                   "csv": "csv", "file": "csv", "upload": "csv"}
+        if source not in aliases:
+            source = "gate"
+        source = aliases[source]
+        return HistoryRequest(
+            source=source,
+            symbol=params.get("symbol") or bt_settings.symbol,
+            market_type=params.get("market_type") or bt_settings.market_type,
+            timeframe=params.get("timeframe") or bt_settings.timeframe,
+            limit=int(params.get("limit_candles") or params.get("limit") or 3000),
+            date_from=params.get("date_from"),
+            date_to=params.get("date_to"),
+            file=str(params.get("file") or ""),
+            seed=int(params.get("seed") or 7),
+        )
+
+    async def _load_backtest_candles(self, bt_settings: BotSettings, req: HistoryRequest,
+                                    job: Dict[str, Any]) -> tuple[List[Candle], Dict[str, Any]]:
+        """Свечи для бэктеста + описание источника данных."""
+
+        def progress(loaded: int, total: Optional[int], message: str) -> None:
+            if job.get("cancel"):
+                raise asyncio.CancelledError()
+            job["progress"] = {
+                "candles": loaded, "total": total, "message": message,
+                "percent": round(min(99.0, loaded / total * 100)) if total else None,
+            }
+
+        if req.source == "synthetic":
             from .feed import demo_candles
-            candles = demo_candles(limit, seed=int(params.get("seed") or 7),
-                                   settings=bt_settings)
-        else:
-            feed = make_feed(bt_settings)
-            try:
-                candles = await self._fetch_history_deep(bt_settings, feed, limit)
-            finally:
-                await feed.close()
-        if not candles:
-            return {"ok": False, "error": "не удалось получить историю свечей"}
-        result = run_backtest(candles, bt_settings, initial_balance=bt_settings.paper_balance_usd)
-        bt_id = self.db.save_backtest({**params, "settings": bt_settings.model_dump(
-            exclude={"api_key", "api_secret"})}, result)
-        result["ok"] = True
-        result["id"] = bt_id
+            limit = max(200, min(int(req.limit or 3000), 50_000))
+            job["progress"] = {"candles": 0, "total": limit, "percent": 0,
+                               "message": f"генерирую {limit} синтетических свечей"}
+            candles = demo_candles(limit, seed=req.seed, settings=bt_settings)
+            info = {"source": "synthetic", "label": "синтетические свечи (выдуманный рынок)"}
+            info.update(describe_candles(candles, req.timeframe))
+            return candles, info
+
+        if req.source == "csv":
+            from .history import file_path
+            if not req.file:
+                raise ValueError("не выбран файл со свечами")
+            path = file_path(req.file)
+            if not path.exists():
+                raise ValueError(f"файл {path.name} не найден в папке данных (data/candles)")
+            job["progress"] = {"candles": 0, "total": None, "percent": None,
+                               "message": f"читаю файл {path.name}"}
+            candles = read_csv(path.read_text(encoding="utf-8", errors="replace"))
+            info = {"source": "csv", "file": path.name, "label": f"файл {path.name}"}
+            info.update(describe_candles(candles, req.timeframe))
+            return candles, info
+
+        job["progress"] = {"candles": 0, "total": None, "percent": None,
+                           "message": "скачиваю историю с Gate.io…"}
+        candles = await download_candles(bt_settings, req, progress=progress)
+        name = downloaded_filename(req)
+        try:
+            save_file(name, write_csv(candles))
+        except Exception:
+            name = ""
+        info = {"source": "gate", "file": name,
+                "label": f"история Gate.io {req.symbol} {req.timeframe}",
+                "symbol": req.symbol, "market_type": req.market_type}
+        info.update(describe_candles(candles, req.timeframe))
+        return candles, info
+
+    def _new_backtest_job(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        job: Dict[str, Any] = {
+            "id": uuid.uuid4().hex[:12],
+            "state": "running",
+            "created_at": now_ms(),
+            "finished_at": None,
+            "params": dict(params or {}),
+            "progress": {"candles": 0, "total": None, "percent": None, "message": "подготовка…"},
+            "data": {},
+            "error": "",
+            "result": None,
+            "result_id": None,
+            "cancel": False,
+        }
+        self.backtest_jobs[job["id"]] = job
+        while len(self.backtest_jobs) > 8:      # держим в памяти только свежие задания
+            oldest = next(iter(self.backtest_jobs))
+            if oldest == job["id"]:
+                break
+            self.backtest_jobs.pop(oldest, None)
+        return job
+
+    @staticmethod
+    def public_job(job: Dict[str, Any]) -> Dict[str, Any]:
+        """Задание без тяжёлого результата (для опроса состояния)."""
+        return {k: v for k, v in job.items() if k not in ("result", "cancel")}
+
+    def backtest_job(self, job_id: str) -> Optional[Dict[str, Any]]:
+        return self.backtest_jobs.get(job_id)
+
+    def list_backtest_jobs(self) -> List[Dict[str, Any]]:
+        return [self.public_job(j) for j in sorted(self.backtest_jobs.values(),
+                                                   key=lambda j: j["created_at"], reverse=True)]
+
+    def cancel_backtest_job(self, job_id: str) -> bool:
+        job = self.backtest_jobs.get(job_id)
+        if job is None or job["state"] != "running":
+            return False
+        job["cancel"] = True
+        return True
+
+    def start_backtest_job(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        job = self._new_backtest_job(params)
+        task = asyncio.create_task(self._execute_backtest(job))
+        self._backtest_tasks[job["id"]] = task
+        task.add_done_callback(lambda _t: self._backtest_tasks.pop(job["id"], None))
+        return {"ok": True, "job": self.public_job(job)}
+
+    async def run_backtest(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Синхронно прогнать бэктест (небольшие периоды, тесты, curl)."""
+        job = self._new_backtest_job(params)
+        await self._execute_backtest(job)
+        if job["state"] == "error":
+            return {"ok": False, "error": job["error"], "job_id": job["id"]}
+        result = job["result"] or {"ok": False, "error": "нет результата"}
         return result
 
-    async def _fetch_history_deep(self, settings: BotSettings, feed, limit: int) -> List[Candle]:
-        """Fetch ``limit`` closed candles from the exchange (paginated)."""
-        ex = None
-        getattr_result = []
-        if hasattr(feed, "_client"):
-            ex = await feed._client()  # type: ignore[attr-defined]
-        if ex is None:
-            return []
-        symbol = getattr(feed, "unified", settings.symbol)
-        tf_ms = settings.tf_seconds() * 1000
-        since = now_ms() - limit * tf_ms
-        out: List[Candle] = []
-        while len(out) < limit:
-            rows = await ex.fetch_ohlcv(symbol, settings.timeframe, since=since, limit=1000)
-            if not rows:
-                break
-            batch = [Candle.from_ccxt(r) for r in rows]
-            out.extend(batch)
-            since = batch[-1].ts + tf_ms
-            if batch[-1].ts + tf_ms > now_ms():
-                break
-            if len(batch) < 2:
-                break
-        now = now_ms()
-        return [c for c in out if c.ts + tf_ms <= now][-limit:]
+    async def _execute_backtest(self, job: Dict[str, Any]) -> None:
+        """Скачать/прочитать данные и прогнать по ним ту же стратегию."""
+        params = job["params"]
+        try:
+            bt_settings = self._backtest_settings(params)
+            req = self._backtest_request(bt_settings, params)
+            job["data"] = req.describe()
+            candles, info = await self._load_backtest_candles(bt_settings, req, job)
+            job["data"].update(info)
+            job["progress"] = {"candles": len(candles), "total": len(candles), "percent": 99,
+                               "message": "считаю сделки и статистику…"}
+            result = run_backtest(candles, bt_settings, initial_balance=bt_settings.paper_balance_usd)
+            result["ok"] = True
+            result["data"] = info
+            result["params"] = req.describe()
+            bt_id = self.db.save_backtest(
+                {**params, "source": req.source, "data": info,
+                 "settings": bt_settings.model_dump(exclude={"api_key", "api_secret"})}, result)
+            result["id"] = bt_id
+            job["result"] = result
+            job["result_id"] = bt_id
+            job["state"] = "done"
+            job["progress"] = {"candles": len(candles), "total": len(candles), "percent": 100,
+                               "message": f"готово: {len(candles)} свечей, {result.get('cycles', 0)} циклов"}
+            self.log("info", f"Бэктест готов: {info.get('label', req.source)}, "
+                             f"свечей {len(candles)}, циклов {result.get('cycles', 0)}, "
+                             f"профит {result.get('total_pnl', 0):+.4f}$", persist=False)
+        except asyncio.CancelledError:
+            job["state"] = "cancelled"
+            job["error"] = "загрузка остановлена пользователем"
+            job["progress"]["message"] = "остановлено"
+        except Exception as exc:
+            job["state"] = "error"
+            job["error"] = str(exc)
+            job["progress"]["message"] = "ошибка"
+            self.log("error", f"бэктест не удался: {exc}", persist=False)
+        finally:
+            job["finished_at"] = now_ms()
+            job["cancel"] = False
+            self.broadcast({"type": "backtest", "job": self.public_job(job)})

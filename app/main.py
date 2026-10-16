@@ -18,14 +18,35 @@ from .bot import BotRuntime
 from .brokers.gate import test_credentials
 from .config import DEFAULT_SETTINGS, BotSettings
 from .db import Database
+from .feed import check_gate_connection
+from .history import (HistoryError, describe as describe_candles, delete_file, file_info,
+                      list_files, read_csv, save_file)
 
 ROOT = Path(__file__).resolve().parent.parent
 WEB_DIR = ROOT / "web"
 
 #: preset applied on the very first start (handy for local demo)
 PRESETS: Dict[str, Dict[str, Any]] = {
+    # «демо-режим» = виртуальные деньги (paper) на РЕАЛЬНЫХ свечах Gate.io.
+    # API-ключи не нужны, интернет нужен.
     "demo": {
-        "data_source": "demo",
+        "data_source": "gate",
+        "trade_mode": "paper",
+        "timeframe": "5m",
+        "candles_count": 3,
+        "min_move_pct": 0.45,
+        "fib_goal_pct": 50.0,
+        "min_profit_pct": 0.2,
+        "base_volume_usd": 10.0,
+        "volume_multiplier": 2.0,
+        "multiplier_start_position": 3,
+        "max_positions": 6,
+        "total_profit_target_usd": 20.0,
+        "symbol": "BTC/USDT",
+    },
+    # полностью выдуманный рынок — только посмотреть панель без интернета
+    "synthetic": {
+        "data_source": "synthetic",
         "trade_mode": "paper",
         "timeframe": "1m",
         "candles_count": 3,
@@ -39,7 +60,7 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         "total_profit_target_usd": 20.0,
         "symbol": "BTC/USDT",
         "demo_speed": 30.0,
-    }
+    },
 }
 
 
@@ -67,7 +88,19 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
         db.save_settings(settings)
     settings = db.load_settings(DEFAULT_SETTINGS)
 
+    # Миграция: раньше "demo" означало выдуманный рынок. Пользователь просил демо-режим
+    # на реальных данных, поэтому переводим такие настройки на свечи Gate.io
+    # (виртуальные сделки сохраняются) и пишем об этом в журнал — молча ничего не меняем.
+    stored = db.kv_get("settings") or {}
+    if isinstance(stored, dict) and str(stored.get("data_source", "")).lower() == "demo":
+        settings.data_source = "gate"
+        db.save_settings(settings)
+
     runtime = BotRuntime(db, settings)
+    if isinstance(stored, dict) and str(stored.get("data_source", "")).lower() == "demo":
+        runtime.log("info", "Источник данных переключён с выдуманного рынка на реальные свечи "
+                            "Gate.io — сделки по-прежнему виртуальные (paper), API-ключи не нужны",
+                    persist=False)
 
     auth_user = os.environ.get("PLANB_AUTH_USER", "").strip()
     auth_pass = os.environ.get("PLANB_AUTH_PASSWORD", "").strip()
@@ -152,6 +185,22 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
 
     app = FastAPI(title="PlanB — Fibonacci bot for Gate.io", version=__version__,
                   docs_url="/api/docs", openapi_url="/api/openapi.json")
+
+    @app.middleware("http")
+    async def no_cache_middleware(request: Request, call_next):
+        """Запрещаем браузеру держать старую версию страницы.
+
+        Из-за кеша «белый экран» оставался виден даже после исправления на сервере.
+        Страница и API всегда берутся заново, статика — с проверкой изменений.
+        """
+        response = await call_next(request)
+        path = request.url.path
+        if path.startswith("/static/"):
+            response.headers.setdefault("Cache-Control", "no-cache, must-revalidate")
+        else:
+            response.headers.setdefault("Cache-Control", "no-store, must-revalidate")
+            response.headers.setdefault("Pragma", "no-cache")
+        return response
 
     @app.middleware("http")
     async def auth_middleware(request: Request, call_next):
@@ -249,12 +298,26 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
         except ValidationError as exc:
             return JSONResponse(status_code=422, content={"ok": False, "error": exc.errors(
                 include_url=False, include_context=False)})
-        if candidate.data_source == "demo":
-            return {"ok": True, "demo": True,
-                    "message": "Демо-данные: подключение к бирже не требуется"}
+        if candidate.synthetic_data:
+            return {"ok": True, "synthetic": True, "real_data": False,
+                    "message": "Выбран синтетический рынок (выдуманные свечи) — биржа не нужна. "
+                               "Чтобы работать на реальных данных, выберите источник «Gate.io»."}
+        public = await check_gate_connection(candidate)
         if not candidate.api_key or not candidate.api_secret:
-            return {"ok": False, "error": "не заданы API-ключи"}
-        return await test_credentials(candidate)
+            public["keys_present"] = False
+            public["note"] = ("Реальные свечи идут без API-ключей. Ключи нужны только для "
+                              "реальной торговли (режим live) и для показа баланса.")
+            return public
+        private = await test_credentials(candidate)
+        private["keys_present"] = True
+        private["public"] = public
+        if private.get("ok") and public.get("ok"):
+            private["message"] = (f"ключи рабочие, реальные данные идут: "
+                                  f"{public.get('symbol')} {public.get('timeframe')}, "
+                                  f"цена {public.get('price')}")
+        elif not private.get("ok"):
+            private["error"] = f"ключи не сработали: {private.get('error')}"
+        return private
 
     @app.post("/api/bot/start")
     async def bot_start():
@@ -295,7 +358,7 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
 
     @app.get("/api/markets")
     async def markets(query: str = "", limit: int = Query(default=50, ge=1, le=500)):
-        if runtime.settings.data_source == "demo":
+        if runtime.settings.synthetic_data:
             base = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "XRP/USDT", "TON/USDT",
                     "DOGE/USDT", "ADA/USDT", "AVAX/USDT", "LINK/USDT"]
             return {"ok": True, "demo": True, "markets": [m for m in base if query.upper() in m]}
@@ -332,13 +395,80 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
     # -------------------------------------------------------------- backtest
     @app.post("/api/backtest")
     async def backtest(payload: Optional[Dict[str, Any]] = None):
+        """Бэктест синхронно (небольшие периоды, удобно для curl и тестов)."""
         try:
             return await runtime.run_backtest(payload or {})
         except ValidationError as exc:
             return JSONResponse(status_code=422, content={"ok": False, "error": exc.errors(
                 include_url=False, include_context=False)})
+        except HistoryError as exc:
+            return JSONResponse(status_code=400, content={"ok": False, "error": str(exc)})
         except Exception as exc:
             return JSONResponse(status_code=500, content={"ok": False, "error": str(exc)})
+
+    @app.post("/api/backtest/job")
+    async def backtest_job_start(payload: Optional[Dict[str, Any]] = None):
+        """Запустить бэктест в фоне (загрузка истории с биржи может идти минутами).
+
+        Панель опрашивает ``/api/backtest/job/{id}`` и показывает ход загрузки.
+        """
+        return runtime.start_backtest_job(payload or {})
+
+    @app.get("/api/backtest/jobs")
+    async def backtest_jobs():
+        return {"ok": True, "jobs": runtime.list_backtest_jobs()}
+
+    @app.get("/api/backtest/job/{job_id}")
+    async def backtest_job_get(job_id: str, result: int = Query(default=1, ge=0, le=1)):
+        job = runtime.backtest_job(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="задание не найдено")
+        payload = runtime.public_job(job)
+        payload["ok"] = job["state"] != "error"
+        if result and job["state"] == "done":
+            payload["result"] = job["result"]
+        return payload
+
+    @app.post("/api/backtest/job/{job_id}/cancel")
+    async def backtest_job_cancel(job_id: str):
+        if not runtime.cancel_backtest_job(job_id):
+            return {"ok": False, "error": "задание не выполняется"}
+        return {"ok": True}
+
+    # ------------------------------------------------- свечи: файлы и загрузка
+    @app.get("/api/backtest/files")
+    async def backtest_files():
+        """Список CSV со свечами (data/candles) — свои файлы для бэктеста."""
+        from .history import history_dir
+        return {"ok": True, "files": list_files(), "dir": str(history_dir())}
+
+    @app.post("/api/backtest/files")
+    async def backtest_file_upload(request: Request,
+                                   name: str = Query(default="candles.csv", max_length=120)):
+        """Загрузить свои свечи (CSV в теле запроса, текст)."""
+        raw = (await request.body()).decode("utf-8", errors="replace")
+        try:
+            candles = read_csv(raw)
+        except HistoryError as exc:
+            return JSONResponse(status_code=400, content={"ok": False, "error": str(exc)})
+        from .history import file_path
+        path = save_file(name, raw)
+        info = {"name": path.name, "label": f"файл {path.name}"}
+        info.update(describe_candles(candles))
+        return {"ok": True, "file": file_info(path.name), "candles": len(candles), "data": info}
+
+    @app.get("/api/backtest/files/{name}")
+    async def backtest_file_download(name: str):
+        from .history import file_path
+        path = file_path(name)
+        if not path.exists():
+            raise HTTPException(status_code=404, detail="файл не найден")
+        return FileResponse(str(path), media_type="text/csv",
+                            filename=path.name)
+
+    @app.delete("/api/backtest/files/{name}")
+    async def backtest_file_delete(name: str):
+        return {"ok": delete_file(name)}
 
     @app.get("/api/backtests")
     async def backtests():

@@ -74,20 +74,23 @@ fi
 
 # --------------------------------------------------------------- 4. локально
 head_ "4. Ответ на самом сервере (127.0.0.1:$PORT)"
-CODE="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:${PORT}/api/health" || echo 000)"
+CODE="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:${PORT}/api/health" 2>/dev/null || true)"
+[ -z "$CODE" ] && CODE=000
 if [ "$CODE" = "200" ]; then
     ok "/api/health -> 200 ($(curl -s --max-time 5 "http://127.0.0.1:${PORT}/api/health"))"
 else
     note_problem "/api/health -> $CODE (ожидалось 200)"
 fi
-CODE_PAGE="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "${AUTH_CURL[@]}" "http://127.0.0.1:${PORT}/" || echo 000)"
+CODE_PAGE="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "${AUTH_CURL[@]}" "http://127.0.0.1:${PORT}/" 2>/dev/null || true)"
+[ -z "$CODE_PAGE" ] && CODE_PAGE=000
 if [ "$CODE_PAGE" = "200" ]; then
     ok "главная страница отдаётся (200)"
 else
     note_problem "главная страница -> $CODE_PAGE"
 fi
 for asset in static/styles.css static/app.js static/vendor/lightweight-charts.standalone.production.js; do
-    C="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:${PORT}/$asset" || echo 000)"
+    C="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:${PORT}/$asset" 2>/dev/null || true)"
+    [ -z "$C" ] && C=000
     [ "$C" = "200" ] && ok "$asset -> 200" || note_problem "$asset -> $C"
 done
 
@@ -95,7 +98,8 @@ done
 head_ "5. Доступ из интернета"
 EXT_IP="$(curl -s --max-time 5 https://api.ipify.org || hostname -I 2>/dev/null | awk '{print $1}')"
 info "внешний IP этого сервера: ${EXT_IP:-неизвестен}"
-CODE_EXT="$(curl -s -o /dev/null -w '%{http_code}' --max-time 6 "http://${EXT_IP:-127.0.0.1}:${PORT}/api/health" || echo 000)"
+CODE_EXT="$(curl -s -o /dev/null -w '%{http_code}' --max-time 6 "http://${EXT_IP:-127.0.0.1}:${PORT}/api/health" 2>/dev/null || true)"
+[ -z "$CODE_EXT" ] && CODE_EXT=000
 if [ "$CODE_EXT" = "200" ]; then
     ok "локально по внешнему адресу отвечает: http://${EXT_IP}:${PORT}/api/health"
     info "важно: эта проверка идёт с самого сервера и НЕ доказывает, что порт открыт"
@@ -192,8 +196,18 @@ s = json.loads(raw)
 e = s.get("engine") or {}
 status = s.get("status")
 source = s.get("data_source")
+source_label = s.get("data_source_label") or source
+real = s.get("data_real")
 mode = s.get("trade_mode")
-print("      статус: %s | данные: %s | режим: %s" % (status, source, mode))
+print("      статус: %s | режим: %s" % (status, mode))
+print("      данные: %s (%s)" % (source_label, "РЕАЛЬНЫЕ, с биржи" if real else "выдуманные (синтетика)"))
+feed = s.get("feed") or {}
+if feed.get("last_error"):
+    print("      ОШИБКА ДАННЫХ: %s" % feed.get("last_error"))
+if feed.get("last_candle_ts"):
+    import time as _t
+    print("      последняя свеча: %s UTC"
+          % _t.strftime("%d.%m.%Y %H:%M", _t.gmtime(feed["last_candle_ts"] / 1000)))
 print("      пара: %s %s | цена: %s" % (s.get("symbol"), s.get("timeframe"), s.get("price")))
 print("      профит: %s $ | циклов: %s | сигналов: %s"
       % (e.get("realized_pnl"), e.get("cycles_total"), e.get("signals_found")))
@@ -206,6 +220,37 @@ print("      последняя проверка: %s" % e.get("last_check"))
 PYEOF
 else
     info "не удалось получить /api/state (нужны логин/пароль или бот не отвечает)"
+fi
+
+# --------------------------------------------------------- 8. связь с биржей
+head_ "8. Реальные данные с биржи (Gate.io)"
+GATE_URL='https://api.gateio.ws/api/v4/spot/candlesticks?currency_pair=BTC_USDT&interval=5m&limit=2'
+GATE_CODE="$(curl -s -o /tmp/planb_gate.json -w '%{http_code}' --max-time 15 "$GATE_URL" 2>/dev/null || true)"
+[ -z "$GATE_CODE" ] && GATE_CODE=000
+if [ "$GATE_CODE" = "200" ]; then
+    ok "сервер видит биржу Gate.io (HTTP 200) — реальные свечи будут приходить"
+    GATE_PRICE="$(python3 - <<'PYEOF' 2>/dev/null || true
+import json
+try:
+    rows = json.load(open("/tmp/planb_gate.json"))
+    print(rows[-1][2])
+except Exception:
+    pass
+PYEOF
+)"
+    [ -n "$GATE_PRICE" ] && info "последняя цена BTC/USDT с биржи: $GATE_PRICE (значит данные настоящие)"
+    if grep -q 'PLANB_PRESET=synthetic' "$ENV_FILE" 2>/dev/null; then
+        bad "в .env стоит PLANB_PRESET=synthetic — бот работает на выдуманных свечах"
+        info "чтобы работать на реальных данных: уберите строку PLANB_PRESET (или поставьте demo) и"
+        info "перезапустите сервис, либо выберите источник «Gate.io» на вкладке «Настройки» в панели"
+    fi
+elif [ "$GATE_CODE" = "000" ]; then
+    note_problem "с сервера нет связи с api.gateio.ws — реальные свечи получить не удастся"
+    info "проверьте интернет/DNS:  curl -v --max-time 15 'https://api.gateio.ws/api/v4/spot/time'"
+    info "если биржа закрыта для вашей страны — используйте синтетику или прокси/другой сервер"
+else
+    note_problem "биржа ответила кодом $GATE_CODE на публичный запрос свечей"
+    info "попробуйте вручную:  curl -s -m 15 '$GATE_URL' | head -c 300"
 fi
 
 # ------------------------------------------------------------------- итоги
@@ -224,6 +269,12 @@ if [ "$PROBLEMS" -eq 0 ]; then
        отключить пароль: bash $PLANB_DIR/deploy/set-auth.sh --off
        посмотреть доступ: bash $PLANB_DIR/deploy/set-auth.sh --show
     5) если не открывается — пришлите текст с экрана: панель пишет причину прямо на странице.
+
+  Реальные данные (виртуальные сделки на настоящих свечах):
+    • вкладка «Настройки» → «Источник данных» = Gate.io → «Сохранить» (API-ключи НЕ нужны);
+    • кнопка «Проверить подключение» покажет цену и задержку ответа биржи;
+    • бэктест на реальной истории: вкладка «Бэктест» → выбрать пару, период и нажать
+      «Скачать и запустить» — свечи сервер загрузит сам, ничего искать не нужно.
 EOF
 else
     printf '  \033[1;33mНайдено проблем: %s.\033[0m Смотрите пункты, отмеченные [!!].\n\n' "$PROBLEMS"

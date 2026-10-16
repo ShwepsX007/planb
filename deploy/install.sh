@@ -16,8 +16,10 @@
 #      PLANB_AUTH_PASSWORD=...        пароль (если пусто — сгенерируется)
 #      PLANB_REPO=https://github.com/ShwepsX007/planb.git
 #      PLANB_BRANCH=auto              auto|main|<ветка>
-#      PLANB_PRESET=demo              demo — синтетический рынок (браузер без ключей);
-#                                     пусто — реальные данные Gate.io
+#      PLANB_PRESET=demo              demo — РЕАЛЬНЫЕ свечи Gate.io + виртуальные сделки
+#                                     (по умолчанию; API-ключи не нужны, нужен интернет);
+#                                     synthetic — выдуманный рынок (посмотреть панель без интернета);
+#                                     пусто — стартовые настройки по умолчанию (тоже реальные данные)
 #      PLANB_AUTOSTART=1              поднимать бота после перезагрузки сервера
 #      PLANB_OPEN_FIREWALL=0          1 — автоматически открыть порт в ufw/firewalld
 #      PLANB_SOURCE=/путь/к/коду      установить из локального каталога вместо git
@@ -213,7 +215,11 @@ if printf '%s' "$PLANB_AUTH_PASSWORD" | LC_ALL=C grep -q '[^ -~]'; then
       браузер капризничает — задайте пароль из латиницы и цифр:
       PLANB_AUTH_PASSWORD='novy-parol123' bash $PLANB_DIR/deploy/install.sh"
 fi
-[ -n "$PLANB_PRESET" ] && note "пресет данных: $PLANB_PRESET (демо-рынок; реальные данные включаются в панели)"
+if [ "$PLANB_PRESET" = "synthetic" ]; then
+    note "пресет данных: синтетический рынок (выдуманные свечи — только для проверки панели)"
+else
+    note "пресет данных: реальные свечи Gate.io + виртуальные сделки (paper), ключи биржи не нужны"
+fi
 
 # ---------------------------------------------------------------- 5. systemd
 log "Настраиваю systemd-сервис $SERVICE_NAME"

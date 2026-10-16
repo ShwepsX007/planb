@@ -20,7 +20,7 @@
   <div class="status-cluster">
     <span id="statusBadge" class="badge badge-stopped">остановлен</span>
     <span id="modeBadge" class="badge badge-mode">paper</span>
-    <span id="demoBadge" class="badge badge-demo hidden">DEMO-ДАННЫЕ</span>
+    <span id="dataBadge" class="badge badge-real hidden">РЕАЛЬНЫЕ ДАННЫЕ</span>
     <span class="pair" id="pairInfo">BTC/USDT · 5m</span>
     <span class="price" id="priceInfo">—</span>
   </div>
@@ -192,15 +192,40 @@
   <!-- ============================================================= backtest -->
   <section class="panel" id="tab-backtest">
     <div class="box">
-      <div class="box-head"><h2>Проверка стратегии на истории</h2></div>
-      <div class="bt-form" id="btForm"></div>
+      <div class="box-head"><h2>Проверка стратегии на реальной истории</h2>
+        <span class="muted">те же настройки и тот же код, что и в торговле</span>
+      </div>
+      <div id="btHint" class="hint-banner hidden"></div>
+      <div class="bt-sources">
+        <div class="bt-source">
+          <h3>1. Свечи с биржи Gate.io</h3>
+          <p class="muted">Данные качает сам сервер прямо с биржи (публичный API, API-ключи не нужны) —
+          вам не нужно ничего искать и загружать. Даты — в UTC.</p>
+          <div class="bt-form" id="btForm"></div>
+        </div>
+        <div class="bt-source">
+          <h3>2. Или свои свечи (CSV)</h3>
+          <p class="muted">Подойдёт любой CSV с колонками <code>ts,open,high,low,close,volume</code>:
+          выгрузка Gate.io, TradingView, Excel (разделитель «,» или «;», время секундами,
+          миллисекундами или датой). Загруженный файл остаётся на сервере — его можно
+          прогонять повторно с другими параметрами.</p>
+          <div class="row">
+            <input type="file" id="btFile" accept=".csv,.txt,text/csv">
+            <button class="btn btn-small" id="btnUploadCsv">Загрузить на сервер</button>
+          </div>
+          <div id="btFiles" class="bt-files"></div>
+        </div>
+      </div>
       <div class="row">
-        <button class="btn btn-green" id="btnRunBacktest">Запустить бэктест</button>
+        <button class="btn btn-green" id="btnRunBacktest">Скачать и запустить</button>
+        <button class="btn btn-small" id="btnRunCsv">Запустить на выбранном файле</button>
+        <button class="btn btn-small" id="btnRunSynthetic">Синтетика (без интернета)</button>
+        <button class="btn btn-small" id="btnCancelBacktest" disabled>Отменить</button>
         <span class="muted" id="btStatus"></span>
       </div>
-      <p class="muted">Бэктест использует те же настройки и тот же код стратегии, что и реальная торговля.
-      Источник данных «demo» — синтетические свечи (работает без интернета), «gate» — реальная история с биржи.</p>
+      <div class="progress"><div class="progress-bar" id="btProgressBar"></div></div>
     </div>
+
     <div class="cards" id="btStats"></div>
     <div class="grid2">
       <div class="box"><h2>Кривая доходности</h2><div id="btEquity" class="chart chart-small"></div></div>
@@ -208,6 +233,7 @@
     </div>
     <div class="box">
       <h2>Циклы бэктеста</h2>
+      <p class="muted" id="btDataInfo"></p>
       <table class="tbl" id="btCycles"><thead><tr><th>#</th><th>Сторона</th><th>Позиций</th><th>Средняя</th>
         <th>Цель</th><th>Цена выхода</th><th>Объём, $</th><th>P/L, $</th><th>P/L, %</th><th>Причина</th></tr></thead>
         <tbody></tbody></table>
@@ -223,6 +249,7 @@
           <button class="btn btn-green" id="btnSaveSettings">Сохранить</button>
         </div>
       </div>
+      <div id="connResult" class="hint-banner hidden"></div>
       <div id="settingsForm" class="settings-form"></div>
       <p class="muted">API-ключи хранятся в локальной базе данных на сервере
       (<code>data/planb.sqlite3</code>), доступ к панели можно закрыть логином/паролем

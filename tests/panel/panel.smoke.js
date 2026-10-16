@@ -42,6 +42,10 @@ window.LightweightCharts = {
 /* ---- фейковые данные ---- */
 const snapshot = {
   status: 'running', paused: false, trade_mode: 'live', data_source: 'gate',
+  data_source_label: 'реальные свечи с биржи (gate)', data_real: true,
+  feed: { name: 'gate', label: 'свечи Gate.io (реальные)', real: true, last_error: '',
+          last_ok_ts: Date.now() - 3000, last_candle_ts: Date.now() - 120000,
+          symbol: 'BTC/USDT', timeframe: '5m' },
   symbol: 'BTC/USDT', timeframe: '5m', market_type: 'futures', error: '',
   started_at: Date.now() - 60000, last_loop_ts: Date.now(), loop_count: 42,
   price: 59500.5, balance: { mode: 'paper', total: 1005.25, free: 1005.25, used: 160, start_balance: 1000 },
@@ -89,10 +93,53 @@ const candles = {
   avg_entry: 59050, target: 59350, swing: { low: 58600, high: 60100 }, side: 'long', timeframe: '5m',
 };
 
+const btFiles = { ok: true, files: [
+  { name: 'gate_btcusdt_futures_5m_2026-01-01_2026-01-31.csv', exists: true, ok: true,
+    count: 8640, from_utc: '2026-01-01 00:00', to_utc: '2026-01-31 00:00', size_kb: 512.4,
+    from_ts: Date.now() - 86400000, to_ts: Date.now() },
+] };
+const btResult = {
+  ok: true, id: 7, candles: 8640, from_ts: Date.now() - 86400000, to_ts: Date.now(),
+  initial_balance: 1000, final_equity: 1012.5, total_pnl: 12.5, return_pct: 1.25,
+  cycles: 4, wins: 3, losses: 1, win_rate: 75, avg_cycle_pnl: 3.1, best_cycle: 6.4,
+  worst_cycle: -1.2, profit_factor: 4.1, fees_total: 1.7, max_drawdown: 4.2,
+  max_drawdown_pct: 0.42, max_positions_used: 4, avg_cycle_candles: 190, max_cycle_candles: 420,
+  signals_found: 9, stopped: false, stop_reason: '',
+  data: { source: 'gate', label: 'история Gate.io BTC/USDT 5m', count: 8640,
+          from_utc: '2026-01-01 00:00', to_utc: '2026-01-31 00:00', span_days: 30, gaps: 0,
+          file: 'gate_btcusdt_futures_5m_2026-01-01_2026-01-31.csv' },
+  cycles_list: [{ id: 'btc1', side: 'long', positions: 3, avg_entry: 59000, target: 59300,
+                  close_price: 59320, volume_usd: 70, pnl: 6.4, pnl_pct: 0.54, reason: 'цель',
+                  opened_ts: Date.now() - 86400000, closed_ts: Date.now() - 80000000,
+                  swing_low: 58600, swing_high: 60100 }],
+  trades: [{ ts: Date.now() - 86400000, kind: 'entry', side: 'long', idx: 1, price: 59000,
+             qty: 0.0001, volume_usd: 10, fee: 0.005, reason: 'вход', target: 59300 }],
+  equity_curve: Array.from({ length: 40 }, (_, i) => ({ ts: Date.now() - (40 - i) * 3600000,
+                                                        equity: 1000 + i * 0.3 })),
+};
+let jobPolls = 0;
+
 const calls = [];
 window.fetch = (url, opts) => {
   calls.push(url);
   let body = {};
+  if (url.includes('/api/backtest/job/')) {
+    jobPolls += 1;
+    body = jobPolls >= 2
+      ? { ok: true, id: 'job1', state: 'done', result_id: 7, error: '',
+          progress: { candles: 8640, total: 8640, percent: 100, message: 'готово: 8640 свечей, 4 циклов' },
+          data: btResult.data, result: btResult }
+      : { ok: true, id: 'job1', state: 'running', result_id: null, error: '',
+          progress: { candles: 2000, total: 8640, percent: 23, message: 'скачано 2000 свечей' },
+          data: { source: 'gate' } };
+    return Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve(JSON.stringify(body)) });
+  }
+  if (url.includes('/api/backtest/job')) {
+    body = { ok: true, job: { id: 'job1', state: 'running', progress: { candles: 0, percent: 0,
+             message: 'скачиваю историю с Gate.io…' } } };
+    return Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve(JSON.stringify(body)) });
+  }
+  if (url.includes('/api/backtest/files')) body = btFiles;
   if (url.includes('/api/settings')) body = settings;
   else if (url.includes('/api/state')) body = snapshot;
   else if (url.includes('/api/logs')) body = { logs: [{ ts: Date.now(), level: 'trade', message: 'Вход long по 59300' }] };
@@ -145,6 +192,43 @@ setTimeout(async () => {
   check('история циклов', window.document.querySelectorAll('#cyclesTable tbody tr').length === 1);
   check('сделки', window.document.querySelectorAll('#tradesTable tbody tr').length === 1);
   check('план объёмов', $('planTable').textContent.includes('160'));
+
+  // данные: бейдж и информация об источнике
+  check('бейдж реальных данных', text('dataBadge').includes('РЕАЛЬНЫЕ'), text('dataBadge'));
+  check('источник данных в блоке состояния', $('engineBox').textContent.includes('Gate.io'),
+    $('engineBox').textContent.slice(0, 80));
+  check('время последней свечи показано', $('engineBox').textContent.includes('Последняя свеча'));
+
+  // вкладка бэктеста: период, файлы, запуск задания
+  const btTab = Array.from(window.document.querySelectorAll('.tab')).find((t) => t.dataset.tab === 'backtest');
+  btTab.dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+  await new Promise((r) => setTimeout(r, 200));
+  const hidden = (id) => $(id).closest('.field').classList.contains('hidden');
+  check('по умолчанию период задаётся количеством свечей', !hidden('bt_limit_candles') && hidden('bt_date_from'));
+  $('bt_period_mode').value = 'dates';
+  $('bt_period_mode').dispatchEvent(new window.Event('change'));
+  check('переключение на даты показывает поля периода', hidden('bt_limit_candles') && !hidden('bt_date_from'));
+  $('bt_period_mode').value = 'limit';
+  $('bt_period_mode').dispatchEvent(new window.Event('change'));
+  check('список своих CSV-файлов загружен', $('btFiles').textContent.includes('gate_btcusdt_futures_5m'),
+    $('btFiles').textContent.slice(0, 60));
+
+  $('btnRunBacktest').click();
+  await new Promise((r) => setTimeout(r, 500));
+  check('задание бэктеста отправлено на сервер', calls.some((c) => c.includes('/api/backtest/job')),
+    calls.filter((c) => c.includes('backtest')).slice(-2).join(', '));
+  await new Promise((r) => setTimeout(r, 1600));
+  check('ход загрузки виден', $('btStatus').textContent.length > 0, $('btStatus').textContent);
+  check('полоса загрузки заполнена', ($('btProgressBar').style.width || '0%') === '100%',
+    $('btProgressBar').style.width);
+  check('итоги бэктеста отрисованы', window.document.querySelectorAll('#btCycles tbody tr').length === 1);
+  check('сказано, что история реальная', $('btDataInfo').textContent.includes('Реальная история Gate.io'),
+    $('btDataInfo').textContent);
+  check('карточка итогового баланса',
+    $('btStats').textContent.replace(/[\s\u00a0]/g, '').includes('1012,50'),
+    $('btStats').textContent.slice(0, 60));
+  check('кнопки снова доступны после завершения', $('btnRunBacktest').disabled === false
+    && $('btnCancelBacktest').disabled === true);
 
   // вкладка графика
   const chartTab = Array.from(window.document.querySelectorAll('.tab')).find((t) => t.dataset.tab === 'chart');

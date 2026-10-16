@@ -79,11 +79,11 @@ def test_restored_cycle_is_taken_over_after_restart(tmp_path):
 async def test_startup_event_starts_bot_when_requested(tmp_path, monkeypatch):
     """Проверяем именно ту связку, что включает автозапуск в systemd."""
     from app.main import create_app
-    monkeypatch.setenv("PLANB_PRESET", "demo")      # как в .env, который создаёт install.sh
+    monkeypatch.setenv("PLANB_PRESET", "synthetic")   # автономный запуск без интернета
     db_path = os.path.join(str(tmp_path), "app.sqlite3")
     app = create_app(db_path)
     runtime = app.state.runtime
-    assert runtime.settings.data_source == "demo"
+    assert runtime.settings.data_source == "synthetic"
     runtime.db.kv_set("desired_running", True)
 
     for handler in app.router.on_startup:
@@ -92,6 +92,36 @@ async def test_startup_event_starts_bot_when_requested(tmp_path, monkeypatch):
     assert runtime.status in (STATUS_RUNNING, STATUS_PAUSED)
     assert runtime.engine.last_price > 0
     await runtime.stop()
+
+
+def test_demo_preset_uses_real_exchange_data(tmp_path, monkeypatch):
+    """«Демо-режим» установки = виртуальные сделки на реальных свечах Gate.io."""
+    from app.main import create_app
+    monkeypatch.setenv("PLANB_PRESET", "demo")
+    app = create_app(os.path.join(str(tmp_path), "demo.sqlite3"))
+    settings = app.state.runtime.settings
+    assert settings.data_source == "gate"
+    assert settings.synthetic_data is False
+    assert settings.trade_mode == "paper", "в демо-режиме сделки виртуальные"
+    assert "реальные свечи" in settings.data_source_label()
+
+
+def test_old_demo_setting_is_migrated_to_real_data(tmp_path, monkeypatch):
+    """Старые установки с data_source=demo переводим на реальные свечи и пишем в журнал."""
+    from app.main import create_app
+    monkeypatch.delenv("PLANB_PRESET", raising=False)
+    db_path = os.path.join(str(tmp_path), "old.sqlite3")
+    db = Database(db_path)
+    db.save_settings(BotSettings(**{**make_settings().model_dump(), "data_source": "synthetic"}))
+    db.conn.execute("UPDATE kv SET value=? WHERE key='settings'",
+                    ('{"data_source": "demo", "symbol": "BTC/USDT"}',))
+    db.conn.commit()
+    db.conn.close()
+
+    app = create_app(db_path)
+    runtime = app.state.runtime
+    assert runtime.settings.data_source == "gate"
+    assert any("реальные свечи" in log["message"] for log in runtime.logs)
 
 
 # ------------------------------------------------------------- сброс цикла

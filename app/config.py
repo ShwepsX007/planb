@@ -35,9 +35,9 @@ class BotSettings(BaseModel):
     sandbox: bool = False
     leverage: int = Field(default=5, ge=1, le=100)
     margin_mode: Literal["isolated", "cross"] = "isolated"
-    data_source: Literal["gate", "demo"] = "gate"
+    data_source: Literal["gate", "synthetic"] = "gate"
     demo_speed: float = Field(default=1.0, ge=1, le=600,
-                              description="ускорение DEMO-рынка (1 = реальное время)")
+                              description="ускорение синтетического рынка (1 = реальное время)")
 
     # --------------------------------------------------------------- market data
     timeframe: str = "5m"
@@ -83,6 +83,28 @@ class BotSettings(BaseModel):
     notify_telegram_chat: str = ""
 
     # ------------------------------------------------------------------ helpers
+    @field_validator("data_source", mode="before")
+    @classmethod
+    def _norm_data_source(cls, v: Any) -> Any:
+        """Приводим названия источника данных к двум понятным вариантам.
+
+        * ``gate``      — реальные свечи с биржи Gate.io (нужен только интернет,
+          API-ключи не требуются). Торговать можно виртуально (paper) или реально (live).
+        * ``synthetic`` — выдуманные свечи, чтобы посмотреть панель без интернета.
+
+        Старое значение ``demo`` означало именно синтетику, поэтому оно сохраняется
+        как ``synthetic`` (понятные синонимы принимаются, чтобы ничего не сломать).
+        """
+        if not isinstance(v, str):
+            return v
+        aliases = {
+            "demo": "synthetic", "demos": "synthetic", "synthetic": "synthetic",
+            "synth": "synthetic", "fake": "synthetic", "offline": "synthetic",
+            "gate": "gate", "gateio": "gate", "real": "gate", "exchange": "gate",
+            "live": "gate", "market": "gate", "": "gate",
+        }
+        return aliases.get(v.strip().lower(), v.strip().lower())
+
     @field_validator("timeframe")
     @classmethod
     def _check_timeframe(cls, v: str) -> str:
@@ -105,6 +127,16 @@ class BotSettings(BaseModel):
         if self.market_type == "spot" and self.direction == "short":
             self.direction = "long"
         return self
+
+    @property
+    def synthetic_data(self) -> bool:
+        """True, если свечи выдуманы (нет реального рынка)."""
+        return self.data_source == "synthetic"
+
+    def data_source_label(self) -> str:
+        if self.synthetic_data:
+            return "синтетические свечи (выдуманный рынок)"
+        return f"реальные свечи с биржи ({self.exchange_id})"
 
     def tf_seconds(self) -> int:
         return TIMEFRAMES[self.timeframe]

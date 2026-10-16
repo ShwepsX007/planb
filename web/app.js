@@ -107,7 +107,14 @@ function renderSnapshot(s) {
 
   $('modeBadge').textContent = s.trade_mode === 'live' ? 'LIVE' : 'PAPER';
   $('modeBadge').className = 'badge ' + (s.trade_mode === 'live' ? 'badge-error' : 'badge-mode');
-  $('demoBadge').classList.toggle('hidden', s.data_source !== 'demo');
+  const real = s.data_real !== false && s.data_source !== 'synthetic';
+  const dataBadge = $('dataBadge');
+  if (dataBadge) {
+    dataBadge.textContent = real ? 'РЕАЛЬНЫЕ ДАННЫЕ GATE.IO' : 'СИНТЕТИКА (ВЫДУМАННЫЕ СВЕЧИ)';
+    dataBadge.className = 'badge ' + (real ? 'badge-real' : 'badge-demo');
+    dataBadge.title = s.data_source_label || '';
+    dataBadge.classList.remove('hidden');
+  }
   $('pairInfo').textContent = `${s.symbol} · ${s.timeframe}` + (s.market_type === 'futures' ? ' · фьюч.' : ' · спот');
   $('priceInfo').textContent = s.price ? fmt(s.price, s.price > 100 ? 2 : 5) : '—';
   $('btnStart').disabled = st === 'running';
@@ -169,9 +176,11 @@ function renderStateHint(s, e, c) {
       ? `<b>Бот не смог запуститься:</b> ${escapeHtml(s.error || 'см. журнал')}. ` +
         'Проверьте журнал ниже и настройки (источник данных, ключи биржи).'
       : '<b>Бот не запущен.</b> Нажмите <b>«Старт»</b> вверху страницы. ' +
-        'По умолчанию включён демонстрационный рынок и виртуальные сделки (paper) — ' +
-        'ключи биржи для этого не нужны. Для реальной торговли: вкладка «Настройки» → ' +
-        'источник данных Gate.io, API-ключи, режим live.';
+        (s.data_real === false
+          ? 'Сейчас выбран источник «синтетика» — свечи выдуманные. Чтобы работать на реальных данных, ' +
+            'выберите на вкладке «Настройки» источник «Gate.io» (API-ключи для этого не нужны).'
+          : 'Бот будет торговать виртуальными деньгами (paper) по реальным свечам Gate.io — ' +
+            'API-ключи для этого не нужны.');
   } else if (s.status === 'running' && !s.price) {
     kind = '';
     html = 'Бот запущен и получает первые свечи — данные появятся в течение минуты.';
@@ -180,6 +189,11 @@ function renderStateHint(s, e, c) {
     html = `<b>Цель по общему профиту достигнута</b> (${fmt(e.realized_pnl, 4)} $). ` +
       'Бот остановлен. Чтобы продолжить: увеличьте цель на вкладке «Настройки» ' +
       'или нажмите «Сбросить статистику», затем «Старт».';
+  } else if (s.feed && s.feed.last_error) {
+    kind = 'err';
+    html = `<b>Нет данных с биржи:</b> ${escapeHtml(s.feed.last_error)}. ` +
+      'Проверьте интернет на сервере (команда <code>curl -s -m 10 https://api.gateio.ws/api/v4/spot/time</code>) ' +
+      'или переключитесь на синтетические свечи на вкладке «Настройки».';
   } else if (s.status === 'stopped_by_stop_loss') {
     kind = 'err';
     html = '<b>Цикл закрыт аварийным стоп-лоссом</b> — проверьте журнал и параметры риска ' +
@@ -222,7 +236,12 @@ function renderEngineBox(e, s, c) {
     ['Комиссия/слиппедж', `${app.settings?.fee_pct ?? '—'} % / ${app.settings?.slippage_pct ?? '—'} %`],
     ['Обновление', timeOnly(s.updated_at)],
   ];
-  if (s.error) rows.push(['Ошибка', `<span class="neg">${s.error}</span>`]);
+  const feed = s.feed || {};
+  rows.push(['Источник данных', feed.label || (s.data_real ? 'реальные свечи' : 'синтетика')]);
+  if (feed.last_candle_ts) rows.push(['Последняя свеча', ts(feed.last_candle_ts)]);
+  if (feed.last_ok_ts) rows.push(['Данные получены', timeOnly(feed.last_ok_ts)]);
+  if (feed.last_error) rows.push(['Ошибка данных', `<span class="neg">${escapeHtml(feed.last_error)}</span>`]);
+  if (s.error) rows.push(['Ошибка', `<span class="neg">${escapeHtml(s.error)}</span>`]);
   $('engineBox').innerHTML = kv(rows);
 }
 
@@ -434,8 +453,8 @@ const FIELDS = [
   { group: 'Биржа и подключение', fields: [
     { k: 'market_type', l: 'Тип рынка', t: 'select', o: [['futures', 'Фьючерсы USDT-M (можно шорт)'], ['spot', 'Спот (только лонг)']] },
     { k: 'symbol', l: 'Торговая пара', t: 'text', h: 'например BTC/USDT' },
-    { k: 'data_source', l: 'Источник данных', t: 'select', o: [['gate', 'Gate.io — реальные свечи'], ['demo', 'DEMO — синтетические свечи']] },
-    { k: 'trade_mode', l: 'Режим торговли', t: 'select', o: [['paper', 'Paper — виртуальные сделки'], ['live', 'LIVE — реальные ордера']] },
+    { k: 'data_source', l: 'Источник данных', t: 'select', h: 'реальные свечи нужны и в paper, и в live; ключи не требуются', o: [['gate', 'Gate.io — реальные свечи (интернет)'], ['synthetic', 'Синтетика — выдуманные свечи (без интернета)']] },
+    { k: 'trade_mode', l: 'Режим торговли (деньги)', t: 'select', h: 'paper = виртуальные сделки, live = реальные ордера', o: [['paper', 'Paper — виртуальные сделки на реальных данных'], ['live', 'LIVE — реальные ордера (нужны API-ключи)']] },
     { k: 'api_key', l: 'API key', t: 'text', h: 'пусто = не менять' },
     { k: 'api_secret', l: 'API secret', t: 'password', h: 'хранится только на сервере' },
     { k: 'sandbox', l: 'Testnet', t: 'bool' },
@@ -474,7 +493,7 @@ const FIELDS = [
     { k: 'auto_min_volume', l: 'Поднимать объём до минимума биржи', t: 'bool' },
     { k: 'poll_interval_sec', l: 'Период опроса, сек', t: 'number', step: 0.5, min: 1, max: 60 },
     { k: 'candle_lookback', l: 'Свечей в истории', t: 'number', step: 50, min: 60, max: 1500, int: true },
-    { k: 'demo_speed', l: 'Ускорение DEMO-рынка', t: 'number', step: 1, min: 1, max: 600, h: '1 = реальное время, 60 = 1 минута за секунду' },
+    { k: 'demo_speed', l: 'Ускорение синтетики', t: 'number', step: 1, min: 1, max: 600, h: 'только для синтетических свечей: 1 = реальное время, 60 = минута за секунду' },
   ] },
   { group: 'Уведомления (Telegram, необязательно)', fields: [
     { k: 'notify_telegram_token', l: 'Токен бота', t: 'text' },
@@ -527,67 +546,239 @@ function collectSettings() {
 }
 
 /* ---------------------------------------------------------------- backtest */
+/* Бэктест на реальной истории. Данные скачивает сервер: страницами по 1000 свечей
+   прямо с Gate.io, поэтому пользователю не нужно ничего искать и загружать самому.
+   Большие периоды считаются в фоне — ход виден в полосе загрузки. */
+let btJobId = null;
+let btTimer = null;
+
+const BT_STRATEGY_FIELDS = [
+  ['candles_count', 'Свечей в одну сторону', 'number'],
+  ['min_move_pct', 'Мин. движение, %', 'number'],
+  ['fib_goal_pct', 'Цель по Фибо, %', 'number'],
+  ['min_profit_pct', 'Мин. профит, %', 'number'],
+  ['base_volume_usd', 'Объём 1-й сделки, $', 'number'],
+  ['volume_multiplier', 'Множитель объёма', 'number'],
+  ['multiplier_start_position', 'Умножать с позиции', 'number'],
+  ['max_positions', 'Максимум позиций', 'number'],
+  ['total_profit_target_usd', 'Цель общего профита, $', 'number'],
+  ['paper_balance_usd', 'Стартовый баланс, $', 'number'],
+  ['fee_pct', 'Комиссия, %', 'number'],
+  ['slippage_pct', 'Слиппедж, %', 'number'],
+];
+
 function renderBacktestForm(settings) {
-  const fields = [
-    ['source', 'Источник данных', 'select', [['demo', 'DEMO — синтетика'], ['gate', 'Gate.io — история с биржи']]],
-    ['limit_candles', 'Свечей для теста', 'number', {}],
-    ['seed', 'Seed (демо)', 'number', {}],
-    ['timeframe', 'Таймфрейм', 'tf', {}],
-    ['candles_count', 'Свечей в одну сторону', 'number', {}],
-    ['min_move_pct', 'Мин. движение, %', 'number', {}],
-    ['fib_goal_pct', 'Цель по Фибо, %', 'number', {}],
-    ['min_profit_pct', 'Мин. профит, %', 'number', {}],
-    ['base_volume_usd', 'Объём 1-й сделки, $', 'number', {}],
-    ['volume_multiplier', 'Множитель объёма', 'number', {}],
-    ['multiplier_start_position', 'Умножать с позиции', 'number', {}],
-    ['max_positions', 'Максимум позиций', 'number', {}],
-    ['total_profit_target_usd', 'Цель общего профита, $', 'number', {}],
-    ['paper_balance_usd', 'Стартовый баланс, $', 'number', {}],
-    ['fee_pct', 'Комиссия, %', 'number', {}],
-    ['slippage_pct', 'Слиппедж, %', 'number', {}],
+  const st = settings || {};
+  const defs = {
+    symbol: st.symbol || 'BTC/USDT',
+    market_type: st.market_type || 'futures',
+    timeframe: st.timeframe || '5m',
+    period_mode: 'limit',
+    limit_candles: 3000,
+    date_from: '',
+    date_to: '',
+  };
+  const head = [
+    ['symbol', 'Пара', 'text'],
+    ['market_type', 'Рынок', 'select', [['futures', 'Фьючерсы USDT-M'], ['spot', 'Спот']]],
+    ['timeframe', 'Таймфрейм', 'tf'],
+    ['period_mode', 'Период', 'select', [['limit', 'Последние N свечей'], ['dates', 'С даты по дату (UTC)']]],
+    ['limit_candles', 'Сколько свечей', 'number'],
+    ['date_from', 'С даты', 'text'],
+    ['date_to', 'По дату', 'text'],
   ];
-  const defaults = { source: settings.data_source === 'demo' ? 'demo' : 'gate', limit_candles: 3000, seed: 7 };
-  $('btForm').innerHTML = fields.map(([k, l, t, o]) => {
-    const value = defaults[k] !== undefined ? defaults[k] : (settings[k] !== undefined ? settings[k] : '');
+  const html = (fields) => fields.map(([k, l, t, o]) => {
+    const id = `bt_${k}`;
+    const value = defs[k] !== undefined ? defs[k]
+      : (st[k] !== undefined && st[k] !== null ? st[k] : '');
     if (t === 'select') {
-      const opts = o.map(([v, txt]) => `<option value="${v}" ${value === v ? 'selected' : ''}>${txt}</option>`).join('');
-      return `<div class="field"><label>${l}</label><select id="bt_${k}">${opts}</select></div>`;
+      return `<div class="field"><label>${l}</label><select id="${id}">` +
+        o.map(([v, txt]) => `<option value="${v}" ${value === v ? 'selected' : ''}>${txt}</option>`).join('') +
+        '</select></div>';
     }
     if (t === 'tf') {
-      const tfs = settings.timeframes || ['1m', '5m', '15m', '1h'];
-      return `<div class="field"><label>${l}</label><select id="bt_${k}">${tfs.map((v) => `<option value="${v}" ${value === v ? 'selected' : ''}>${v}</option>`).join('')}</select></div>`;
+      const tfs = st.timeframes || ['1m', '5m', '15m', '1h', '4h', '1d'];
+      return `<div class="field"><label>${l}</label><select id="${id}">` +
+        tfs.map((v) => `<option value="${v}" ${value === v ? 'selected' : ''}>${v}</option>`).join('') +
+        '</select></div>';
     }
-    return `<div class="field"><label>${l}</label><input type="number" step="any" id="bt_${k}" value="${value}"></div>`;
+    return `<div class="field"><label>${l}</label>` +
+      `<input type="${t}" step="any" id="${id}" value="${value}" autocomplete="off"></div>`;
   }).join('');
+  $('btForm').innerHTML = html(head) + html(BT_STRATEGY_FIELDS);
+  const mode = $('bt_period_mode');
+  if (mode) mode.onchange = syncBtPeriod;
+  syncBtPeriod();
+  loadBtFiles();
+}
+
+function syncBtPeriod() {
+  const dates = ($('bt_period_mode') || {}).value === 'dates';
+  const limitField = $('bt_limit_candles');
+  if (limitField) limitField.closest('.field').classList.toggle('hidden', dates);
+  ['bt_date_from', 'bt_date_to'].forEach((id) => {
+    const el = $(id);
+    if (el) el.closest('.field').classList.toggle('hidden', !dates);
+  });
 }
 
 function collectBacktestParams() {
   const params = {};
   document.querySelectorAll('[id^="bt_"]').forEach((el) => {
     const key = el.id.slice(3);
+    if (key === 'period_mode') return;
     const v = el.value;
     if (v === '') return;
-    if (el.tagName === 'SELECT' && key === 'timeframe') params[key] = v;
-    else if (el.type === 'number') params[key] = parseFloat(v);
-    else params[key] = v;
+    if (el.type === 'number') params[key] = parseFloat(v);
+    else params[key] = v.trim();
   });
+  if (($('bt_period_mode') || {}).value === 'limit') {
+    delete params.date_from;
+    delete params.date_to;
+  } else {
+    delete params.limit_candles;
+  }
+  params.source = 'gate';
   return params;
 }
 
-async function runBacktest() {
-  $('btStatus').textContent = 'выполняется…';
-  $('btnRunBacktest').disabled = true;
+/* ---- список своих CSV-файлов на сервере ---- */
+async function loadBtFiles() {
+  const host = $('btFiles');
+  if (!host) return;
+  let data = null;
   try {
-    const result = await api('POST', '/api/backtest', collectBacktestParams());
-    if (!result.ok) throw new Error(result.error || 'ошибка');
-    renderBacktestResult(result);
-    $('btStatus').textContent = `готово: ${result.candles} свечей, ${result.cycles} циклов`;
+    data = await api('GET', '/api/backtest/files');
   } catch (e) {
-    $('btStatus').textContent = '';
-    toast('Бэктест: ' + e.message, 'err');
-  } finally {
-    $('btnRunBacktest').disabled = false;
+    host.innerHTML = `<p class="muted">не удалось получить список файлов: ${escapeHtml(e.message)}</p>`;
+    return;
   }
+  const files = (data.files || []).filter((f) => f.exists);
+  if (!files.length) {
+    host.innerHTML = '<p class="muted">на сервере пока нет своих файлов — можно просто скачать с биржи (слева)</p>';
+    return;
+  }
+  host.innerHTML = files.map((f) => `
+    <div class="bt-file">
+      <label class="bt-file-pick">
+        <input type="radio" name="btfile" value="${f.name}" ${app.btFile === f.name ? 'checked' : ''}>
+        <span><b>${f.name}</b>
+          <span class="muted">${f.ok ? `${fmt(f.count, 0)} свечей · ${f.from_utc} → ${f.to_utc} UTC · ${f.size_kb} КБ`
+            : `не читается: ${escapeHtml(f.error || '')}`}</span></span>
+      </label>
+      <span class="bt-file-actions">
+        <a class="btn btn-small" href="${BASE}api/backtest/files/${encodeURIComponent(f.name)}">Скачать</a>
+        <button class="btn btn-small" data-del="${f.name}">Удалить</button>
+      </span>
+    </div>`).join('');
+  host.querySelectorAll('input[name=btfile]').forEach((el) => {
+    el.onchange = () => { app.btFile = el.value; };
+  });
+  host.querySelectorAll('button[data-del]').forEach((el) => {
+    el.onclick = async () => {
+      if (!confirm(`Удалить файл ${el.dataset.del}?`)) return;
+      await api('DELETE', '/api/backtest/files/' + encodeURIComponent(el.dataset.del)).catch(() => null);
+      if (app.btFile === el.dataset.del) app.btFile = null;
+      loadBtFiles();
+    };
+  });
+}
+
+async function uploadBtCsv() {
+  const input = $('btFile');
+  const file = input && input.files && input.files[0];
+  if (!file) { toast('Выберите CSV-файл', 'err'); return; }
+  const text = await file.text();
+  try {
+    const res = await api('POST', `/api/backtest/files?name=${encodeURIComponent(file.name)}`, text);
+    app.btFile = res.file.name;
+    toast(`Загружено: ${res.file.name} (${res.candles} свечей)`);
+    loadBtFiles();
+  } catch (e) {
+    toast('Файл не принят: ' + e.message, 'err');
+  }
+}
+
+/* ---- запуск и ход задания ---- */
+async function startBacktest(payload, label) {
+  const status = $('btStatus');
+  status.textContent = label || 'запускаю…';
+  setBtProgress(0);
+  $('btnCancelBacktest').disabled = false;
+  ['btnRunBacktest', 'btnRunCsv', 'btnRunSynthetic'].forEach((id) => { $(id).disabled = true; });
+  try {
+    const res = await api('POST', '/api/backtest/job', payload);
+    btJobId = res.job.id;
+    pollBacktest();
+  } catch (e) {
+    status.textContent = '';
+    toast('Бэктест: ' + e.message, 'err');
+    finishBacktest();
+  }
+}
+
+function pollBacktest() {
+  clearTimeout(btTimer);
+  btTimer = setTimeout(async () => {
+    if (!btJobId) return;
+    let job = null;
+    try {
+      job = await api('GET', `/api/backtest/job/${btJobId}`);
+    } catch (e) {
+      $('btStatus').textContent = 'нет связи с сервером: ' + e.message;
+      finishBacktest();
+      return;
+    }
+    const p = job.progress || {};
+    const total = p.total ? ` из ${fmt(p.total, 0)}` : '';
+    $('btStatus').textContent = `${p.message || 'выполняется…'}${p.candles ? ` (${fmt(p.candles, 0)}${total})` : ''}`;
+    setBtProgress(p.percent || (job.state === 'done' ? 100 : 0));
+    if (job.state === 'running') { pollBacktest(); return; }
+    if (job.state === 'done' && job.result) {
+      renderBacktestResult(job.result);
+      $('btStatus').textContent = `${p.message || 'готово'} · id ${job.result_id}`;
+    } else if (job.state === 'cancelled') {
+      $('btStatus').textContent = 'остановлено';
+    } else {
+      $('btStatus').textContent = '';
+      toast('Бэктест не удался: ' + (job.error || 'неизвестная ошибка'), 'err');
+    }
+    finishBacktest();
+  }, 700);
+}
+
+function finishBacktest() {
+  btJobId = null;
+  clearTimeout(btTimer);
+  ['btnRunBacktest', 'btnRunCsv', 'btnRunSynthetic'].forEach((id) => { $(id).disabled = false; });
+  $('btnCancelBacktest').disabled = true;
+}
+
+function setBtProgress(percent) {
+  const bar = $('btProgressBar');
+  if (bar) bar.style.width = Math.max(0, Math.min(100, percent || 0)) + '%';
+}
+
+function runBacktestFromExchange() {
+  startBacktest(collectBacktestParams(), 'скачиваю историю с Gate.io…');
+}
+
+function runBacktestFromCsv() {
+  const params = collectBacktestParams();
+  if (!app.btFile) { toast('Сначала загрузите или выберите CSV-файл', 'err'); return; }
+  startBacktest({ ...params, source: 'csv', file: app.btFile }, `читаю файл ${app.btFile}…`);
+}
+
+function runBacktestSynthetic() {
+  const params = collectBacktestParams();
+  startBacktest({ ...params, source: 'synthetic', limit_candles: params.limit_candles || 3000 },
+                'генерирую синтетические свечи…');
+}
+
+async function cancelBacktest() {
+  if (!btJobId) return;
+  await api('POST', `/api/backtest/job/${btJobId}/cancel`).catch(() => null);
+  $('btStatus').textContent = 'останавливаю…';
 }
 
 function renderBacktestResult(r) {
@@ -604,6 +795,17 @@ function renderBacktestResult(r) {
   $('btStats').innerHTML = cards.map(([l, v, h]) => `<div class="card"><div class="card-label">${l}</div>
     <div class="card-value">${v}</div><div class="card-hint">${h}</div></div>`).join('');
 
+  const d = r.data || {};
+  const info = $('btDataInfo');
+  if (info) {
+    const real = d.source === 'gate';
+    info.innerHTML = d.count
+      ? `${real ? '<b>Реальная история Gate.io</b>' : (d.source === 'csv' ? '<b>Ваш файл</b>' : 'Синтетические свечи')}: ` +
+        `${fmt(d.count, 0)} свечей, ${d.from_utc} → ${d.to_utc} UTC (${d.span_days} дн.)` +
+        (d.gaps ? `, пропусков в данных: ${d.gaps}` : '') +
+        (d.file ? ` · файл <code>${escapeHtml(d.file)}</code>` : '')
+      : '';
+  }
   const tbody = $('btCycles').querySelector('tbody');
   const list = (r.cycles_list || []).slice().reverse();
   tbody.innerHTML = list.length ? list.map((c, i) => `<tr>
@@ -695,12 +897,39 @@ async function saveSettings() {
 }
 
 async function testApi() {
+  const box = $('connResult');
+  const show = (kind, html) => {
+    if (box) { box.className = 'hint-banner ' + kind; box.innerHTML = html; }
+  };
+  if (box) { box.className = 'hint-banner'; box.textContent = 'проверяю связь с биржей…'; }
   try {
     const res = await api('POST', '/api/settings/test-connection', collectSettings());
-    if (res.ok && res.demo) toast('DEMO-режим: биржа не нужна', 'ok');
-    else if (res.ok) toast(`Подключение успешно. Баланс: ${JSON.stringify(res.balance)}`, 'ok');
-    else toast('Ошибка: ' + (res.error || 'неизвестно'), 'err');
-  } catch (e) { toast('Ошибка: ' + e.message, 'err'); }
+    if (res.synthetic) {
+      show('warn', '<b>Выбран источник «синтетика»</b> — свечи выдуманные, к бирже бот не обращается. ' +
+        'Для работы на реальных данных выберите в поле «Источник данных» вариант Gate.io и сохраните настройки.');
+      return;
+    }
+    if (res.ok) {
+      const publicPart = res.public || res;
+      const bits = [];
+      if (publicPart.symbol) bits.push(`пара <b>${publicPart.symbol}</b> (${publicPart.timeframe})`);
+      if (publicPart.price) bits.push(`цена <b>${fmt(publicPart.price, publicPart.price > 100 ? 2 : 5)}</b>`);
+      if (publicPart.candle_ts) bits.push(`последняя свеча ${ts(publicPart.candle_ts)}`);
+      if (publicPart.latency_ms) bits.push(`ответ биржи ${publicPart.latency_ms} мс`);
+      show('ok', '<b>Реальные данные Gate.io идут.</b> ' + bits.join(' · ') +
+        (res.keys_present === false ? '<br>API-ключи не заданы — это нормально для виртуальных сделок ' +
+          'и для бэктеста; ключи понадобятся только для реальной торговли (режим live).' : '') +
+        (res.balance ? `<br>Баланс: ${JSON.stringify(res.balance)}` : ''));
+      toast('Связь с биржей есть', 'ok');
+    } else {
+      show('err', '<b>Не получилось.</b> ' + escapeHtml(res.error || 'неизвестная ошибка') +
+        '<br>Проверьте интернет на сервере: <code>curl -s -m 10 https://api.gateio.ws/api/v4/spot/time</code>');
+      toast('Ошибка: ' + (res.error || 'неизвестно'), 'err');
+    }
+  } catch (e) {
+    show('err', '<b>Ошибка запроса.</b> ' + escapeHtml(e.message));
+    toast('Ошибка: ' + e.message, 'err');
+  }
 }
 
 async function botAction(path, label) {
@@ -775,7 +1004,11 @@ async function init() {
   $('btnRefreshPos').onclick = loadPositions;
   $('btnRefreshCycles').onclick = loadHistory;
   $('btnExportCycles').onclick = exportCyclesCsv;
-  $('btnRunBacktest').onclick = runBacktest;
+  $('btnRunBacktest').onclick = runBacktestFromExchange;
+  $('btnRunCsv').onclick = runBacktestFromCsv;
+  $('btnRunSynthetic').onclick = runBacktestSynthetic;
+  $('btnCancelBacktest').onclick = cancelBacktest;
+  $('btnUploadCsv').onclick = uploadBtCsv;
   $('btnResetCycle').onclick = () => {
     if (confirm('Закрыть незакрытый цикл только в учёте бота? Позиции на бирже не затрагиваются.\n' +
                 'Используйте, если позиция уже закрыта вручную или отсутствует.'))

@@ -1,8 +1,11 @@
-"""Market data feeds.
+"""Источники рыночных данных.
 
-* ``GateFeed``  - real candles from Gate.io through ccxt (spot or USDT perp).
-* ``DemoFeed``  - deterministic synthetic candles, handy for trying the panel
-  without an internet connection / API keys. Clearly marked as DEMO in the UI.
+* ``GateFeed``      — реальные свечи Gate.io через ccxt (спот или USDT-перп).
+  Публичные данные, API-ключи не нужны: виртуальная торговля (paper) идёт
+  по настоящему рынку.
+* ``SyntheticFeed`` — выдуманные свечи (детерминированный random walk), нужны
+  только чтобы посмотреть панель без интернета. В интерфейсе всегда помечаются
+  как «синтетика»: бот никогда не подменяет реальные данные выдуманными молча.
 """
 from __future__ import annotations
 
@@ -29,11 +32,29 @@ MAX_REAL_STEP_SEC = 10.0
 
 class BaseFeed:
     name = "base"
+    label = "данные"
+    #: True, если свечи приходят с реального рынка
+    real = False
 
     def __init__(self, settings: BotSettings) -> None:
         self.settings = settings
         self.candles: List[Candle] = []
         self.last_error: str = ""
+        self.last_ok_ts: int = 0        # когда последний раз удачно получили данные
+        self.last_candle_ts: int = 0    # время последней реальной свечи
+
+    def status(self) -> dict:
+        """Состояние источника данных — показывается в панели."""
+        return {
+            "name": self.name,
+            "label": self.label,
+            "real": bool(self.real),
+            "last_error": self.last_error,
+            "last_ok_ts": self.last_ok_ts,
+            "last_candle_ts": self.last_candle_ts,
+            "symbol": self.settings.symbol,
+            "timeframe": self.settings.timeframe,
+        }
 
     async def history(self, limit: int = 300) -> List[Candle]:
         raise NotImplementedError
@@ -47,7 +68,11 @@ class BaseFeed:
 
 
 class GateFeed(BaseFeed):
+    """Реальные свечи Gate.io (публичный API — ключи не нужны)."""
+
     name = "gate"
+    label = "свечи Gate.io (реальные)"
+    real = True
 
     def __init__(self, settings: BotSettings) -> None:
         super().__init__(settings)
@@ -74,15 +99,33 @@ class GateFeed(BaseFeed):
         return self.ex
 
     async def history(self, limit: int = 300) -> List[Candle]:
-        ex = await self._client()
-        rows = await ex.fetch_ohlcv(self.unified, self.settings.timeframe, limit=min(limit + 1, 1000))
+        try:
+            ex = await self._client()
+            rows = await ex.fetch_ohlcv(self.unified, self.settings.timeframe, limit=min(limit + 1, 1000))
+        except Exception as exc:
+            self.last_error = _friendly_error(exc)
+            raise
         candles = [Candle.from_ccxt(r) for r in rows]
         if candles and not self._is_closed(candles[-1]):
             candles = candles[:-1]
         self.candles = candles
+        self._mark_ok(candles)
         return candles
 
     async def poll(self) -> tuple[List[Candle], float]:
+        try:
+            return await self._poll_once()
+        except Exception as exc:
+            self.last_error = _friendly_error(exc)
+            raise
+
+    def _mark_ok(self, candles: List[Candle]) -> None:
+        self.last_error = ""
+        self.last_ok_ts = now_ms()
+        if candles:
+            self.last_candle_ts = candles[-1].ts
+
+    async def _poll_once(self) -> tuple[List[Candle], float]:
         ex = await self._client()
         rows = await ex.fetch_ohlcv(self.unified, self.settings.timeframe, limit=3)
         candles = [Candle.from_ccxt(r) for r in rows]
@@ -98,6 +141,7 @@ class GateFeed(BaseFeed):
                 self.candles.append(c)
         if len(self.candles) > 1500:
             self.candles = self.candles[-1500:]
+        self._mark_ok(candles)
         # keep the live candle fresh for the chart
         if candles and not self._is_closed(candles[-1]):
             if self.candles and self.candles[-1].ts == candles[-1].ts:
@@ -115,10 +159,12 @@ class GateFeed(BaseFeed):
             self.ex = None
 
 
-class DemoFeed(BaseFeed):
-    """Synthetic, deterministic market used when ``data_source = demo``."""
+class SyntheticFeed(BaseFeed):
+    """Выдуманный рынок (``data_source = synthetic``) — без интернета."""
 
-    name = "demo"
+    name = "synthetic"
+    label = "синтетические свечи (выдуманный рынок)"
+    real = False
 
     def __init__(self, settings: BotSettings, *, seed: int = 20240517,
                  start_price: float = 64000.0, speed: Optional[float] = None) -> None:
@@ -188,6 +234,8 @@ class DemoFeed(BaseFeed):
     async def poll(self) -> tuple[List[Candle], float]:
         now = now_ms()
         real = max(0.0, (now - self._last_tick) / 1000.0)
+        self.last_ok_ts = now
+        self.last_candle_ts = self.candles[-1].ts if self.candles else now
         self._last_tick = now
         # защита от «прыжка» после паузы окружения (сон VPS, рестарт процесса,
         # отладка): длительность шага ограничена, иначе демо-рынок уезжает на часы
@@ -225,11 +273,78 @@ class DemoFeed(BaseFeed):
         return out
 
 
+#: старое имя класса — оставлено, чтобы ничего не сломалось у тех, кто импортировал его
+DemoFeed = SyntheticFeed
+
+
 def make_feed(settings: BotSettings, *, start_price: Optional[float] = None) -> BaseFeed:
-    if settings.data_source == "demo":
-        return DemoFeed(settings, speed=getattr(settings, "demo_speed", 1.0),
-                        start_price=start_price or 64000.0)
+    """Создать источник данных по настройкам.
+
+    ``gate`` (по умолчанию) — реальный рынок; ``synthetic`` — выдуманный.
+    API-ключи для реальных свечей не нужны.
+    """
+    if settings.synthetic_data:
+        return SyntheticFeed(settings, speed=getattr(settings, "demo_speed", 1.0),
+                             start_price=start_price or 64000.0)
     return GateFeed(settings)
+
+
+def _friendly_error(exc: BaseException) -> str:
+    """Человеческое объяснение сетевой ошибки биржи."""
+    text = str(exc) or exc.__class__.__name__
+    low = text.lower()
+    if "451" in low or "restricted" in low or "forbidden" in low or "region" in low:
+        return (f"биржа недоступна с этого сервера (гео-ограничение): {text}")
+    if any(k in low for k in ("timed out", "timeout", "connection", "network", "dns",
+                              "resolve", "unreachable", "ssl", "handshake")):
+        return (f"нет связи с биржей Gate.io: {text}. Проверьте интернет на сервере: "
+                f"curl -s -m 10 'https://api.gateio.ws/api/v4/spot/time'")
+    return text
+
+
+async def check_gate_connection(settings: BotSettings) -> Dict[str, Any]:
+    """Проверить связь с Gate.io по публичным данным (ключи не нужны).
+
+    Возвращает цену, время последней свечи и задержку ответа — чтобы панель
+    показала пользователю, что реальные данные действительно идут.
+    """
+    started = time.perf_counter()
+    feed = GateFeed(settings)
+    try:
+        ex = await feed._client()
+        symbol = feed.unified
+        rows = await ex.fetch_ohlcv(symbol, settings.timeframe, limit=3)
+        latency = int((time.perf_counter() - started) * 1000)
+        if not rows:
+            return {"ok": False, "error": f"биржа не отдала свечи по {symbol} ({settings.timeframe})"}
+        candles = [Candle.from_ccxt(r) for r in rows]
+        closed = [c for c in candles if feed._is_closed(c)]
+        last = (closed or candles)[-1]
+        price = candles[-1].close
+        age_sec = max(0, (now_ms() - last.ts) / 1000.0)
+        return {
+            "ok": True,
+            "real_data": True,
+            "exchange": settings.exchange_id,
+            "symbol": symbol,
+            "timeframe": settings.timeframe,
+            "market_type": settings.market_type,
+            "price": price,
+            "candle_ts": last.ts,
+            "candle_age_sec": round(age_sec, 1),
+            "latency_ms": latency,
+            "message": (f"реальные данные идут: {symbol} {settings.timeframe}, "
+                        f"цена {price:g}, последняя закрытая свеча "
+                        f"{time.strftime('%d.%m.%Y %H:%M', time.gmtime(last.ts / 1000))} UTC"),
+        }
+    except Exception as exc:
+        return {"ok": False, "real_data": True, "exchange": settings.exchange_id,
+                "error": _friendly_error(exc)}
+    finally:
+        try:
+            await feed.close()
+        except Exception:
+            pass
 
 
 def demo_candles(n: int, *, seed: int = 7, start_price: float = 64000.0,
