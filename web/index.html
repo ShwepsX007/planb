@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PlanB — бот на коррекции Фибоначчи (Gate.io)</title>
+<link rel="stylesheet" href="static/styles.css">
+<script src="static/vendor/lightweight-charts.standalone.production.js"></script>
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">Φ</span>
+    <div>
+      <h1>PlanB</h1>
+      <div class="sub">Торговый бот на коррекции Фибоначчи · Gate.io</div>
+    </div>
+  </div>
+
+  <div class="status-cluster">
+    <span id="statusBadge" class="badge badge-stopped">остановлен</span>
+    <span id="modeBadge" class="badge badge-mode">paper</span>
+    <span id="dataBadge" class="badge badge-real hidden">РЕАЛЬНЫЕ ДАННЫЕ</span>
+    <span class="pair" id="pairInfo">BTC/USDT · 5m</span>
+    <span class="price" id="priceInfo">—</span>
+  </div>
+
+  <div class="controls">
+    <button id="btnStart" class="btn btn-green">Старт</button>
+    <button id="btnPause" class="btn">Пауза</button>
+    <button id="btnStop" class="btn">Стоп</button>
+    <button id="btnCloseAll" class="btn btn-red">Закрыть всё</button>
+  </div>
+</header>
+
+<nav class="tabs">
+  <button class="tab active" data-tab="dashboard">Панель</button>
+  <button class="tab" data-tab="chart">График</button>
+  <button class="tab" data-tab="positions">Позиции</button>
+  <button class="tab" data-tab="history">Циклы и сделки</button>
+  <button class="tab" data-tab="backtest">Бэктест</button>
+  <button class="tab" data-tab="settings">Настройки</button>
+  <button class="tab" data-tab="logs">Журнал</button>
+</nav>
+
+<main>
+  <!-- ============================================================ dashboard -->
+  <section class="panel active" id="tab-dashboard">
+    <div id="stateHint" class="hint-banner hidden"></div>
+    <div class="cards">
+      <div class="card"><div class="card-label">Общий профит</div>
+        <div class="card-value" id="cPnl">0.00 $</div>
+        <div class="progress"><div class="progress-bar" id="cProgressBar"></div></div>
+        <div class="card-hint" id="cProgressText">цель: —</div>
+      </div>
+      <div class="card"><div class="card-label">Нереализованный P/L</div>
+        <div class="card-value" id="cUnreal">—</div>
+        <div class="card-hint" id="cUnrealHint">нет открытых позиций</div>
+      </div>
+      <div class="card"><div class="card-label">Средняя входа</div>
+        <div class="card-value" id="cAvg">—</div>
+        <div class="card-hint" id="cAvgHint">позиций: 0</div>
+      </div>
+      <div class="card"><div class="card-label">Цель по Фибоначчи</div>
+        <div class="card-value" id="cTarget">—</div>
+        <div class="card-hint" id="cTargetHint">уровень —</div>
+      </div>
+      <div class="card"><div class="card-label">Профит до цели</div>
+        <div class="card-value" id="cProfitToTarget">—</div>
+        <div class="card-hint" id="cProfitToTargetHint">мин. профит —</div>
+      </div>
+      <div class="card"><div class="card-label">Циклы</div>
+        <div class="card-value" id="cCycles">0</div>
+        <div class="card-hint" id="cCyclesHint">прибыльных 0 · убыточных 0</div>
+      </div>
+      <div class="card"><div class="card-label">Баланс</div>
+        <div class="card-value" id="cBalance">—</div>
+        <div class="card-hint" id="cBalanceHint">—</div>
+      </div>
+      <div class="card"><div class="card-label">Следующий долив</div>
+        <div class="card-value" id="cNextAdd">—</div>
+        <div class="card-hint" id="cNextAddHint">—</div>
+      </div>
+    </div>
+
+    <div class="grid2">
+      <div class="box">
+        <h2>Текущий цикл</h2>
+        <div id="cycleBox" class="kv"></div>
+      </div>
+      <div class="box">
+        <h2>Что делает бот</h2>
+        <div class="kv" id="engineBox"></div>
+      </div>
+    </div>
+
+    <div class="box">
+      <h2>Позиции текущего цикла</h2>
+      <table class="tbl" id="currentPositions">
+        <thead><tr><th>#</th><th>Время</th><th>Цена входа</th><th>Объём, $</th><th>Кол-во</th>
+          <th>Множитель</th><th>P/L</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+
+    <div class="box">
+      <h2>Логика расчёта</h2>
+      <div class="legend">
+        <p><b>1.</b> Бот берёт <span id="lgCandles">3</span> свечей таймфрейма <span id="lgTf">5m</span> в одну сторону
+        и проверяет, что движение от минимума к максимуму этих свечей не меньше
+        <span id="lgMove">—</span>%.</p>
+        <p><b>2.</b> Растягивает сетку Фибоначчи от минимума (0%) до максимума (100%) этих свечей
+        и входит в сделку в сторону коррекции на закрытии последней свечи.</p>
+        <p><b>3.</b> Цель — уровень <span id="lgGoal">—</span>% сетки. Пока цена не дошла до цели, каждое
+        обновление минимума опускает сетку и цель ближе к средней точке входа.</p>
+        <p><b>4.</b> Когда профит от средней входа до цели становится меньше
+        <span id="lgMinProfit">—</span>%, бот доливается: 1-я и 2-я сделки базовым объёмом, далее объём
+        умножается на <span id="lgMult">—</span> — так средняя цена входа опускается ниже цели.</p>
+        <p><b>5.</b> Когда цена достигает цели коррекции и профит от средней входа ≥ минимального —
+        все позиции закрываются, цикл завершён, бот начинает искать новый сигнал.</p>
+        <p><b>6.</b> Работа продолжается, пока общий профит не достигнет цели
+        <span id="lgTotal">—</span>$ (или пока вы не остановите бота).</p>
+      </div>
+      <div class="schedule" id="scheduleBox"></div>
+    </div>
+  </section>
+
+  <!-- ================================================================ chart -->
+  <section class="panel" id="tab-chart">
+    <div class="box">
+      <div class="box-head">
+        <h2>График <span id="chartPair" class="muted"></span></h2>
+        <div class="row">
+          <button class="btn btn-small" id="btnFit">Всё</button>
+          <label class="switch"><input type="checkbox" id="chkFib" checked> Сетка Фибо</label>
+          <label class="switch"><input type="checkbox" id="chkMarks" checked> Сделки</label>
+        </div>
+      </div>
+      <div id="chart" class="chart"></div>
+      <div class="legend chart-legend">
+        <span><i class="dot" style="background:#ffffff"></i> цель (уровень коррекции)</span>
+        <span><i class="dot" style="background:#4da3ff"></i> средняя цена входа</span>
+        <span><i class="dot" style="background:#26a69a"></i> вход/долив</span>
+        <span><i class="dot" style="background:#f0b90b"></i> уровень 0.5</span>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ positions -->
+  <section class="panel" id="tab-positions">
+    <div class="box">
+      <div class="box-head"><h2>Открытые позиции</h2><button class="btn btn-small" id="btnRefreshPos">Обновить</button></div>
+      <table class="tbl" id="openPositionsTable">
+        <thead><tr><th>Цикл</th><th>Сторона</th><th>#</th><th>Время</th><th>Цена</th><th>Объём, $</th>
+          <th>Кол-во</th><th>Множитель</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div class="box">
+      <h2>План объёмов</h2>
+      <div id="planTable" class="schedule"></div>
+      <p class="muted">Объёмы долей считаются по формуле: базовый объём для позиций 1..(N−1), далее каждый
+      следующий объём умножается на множитель, начиная с указанной позиции.</p>
+    </div>
+  </section>
+
+  <!-- ============================================================== history -->
+  <section class="panel" id="tab-history">
+    <div class="box">
+      <div class="box-head"><h2>Завершённые циклы</h2>
+        <div class="row"><button class="btn btn-small" id="btnRefreshCycles">Обновить</button>
+        <button class="btn btn-small" id="btnExportCycles">CSV</button>
+        <button class="btn btn-small" id="btnResetCycle"
+          title="Закрыть незакрытый цикл в учёте, если позиция уже закрыта на бирже вручную">Сбросить цикл</button></div>
+      </div>
+      <table class="tbl" id="cyclesTable">
+        <thead><tr><th>Цикл</th><th>Сторона</th><th>Позиций</th><th>Средняя</th><th>Цель</th>
+          <th>Закрытие</th><th>Объём, $</th><th>P/L, $</th><th>P/L, %</th><th>Причина</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div class="box">
+      <h2>Все сделки</h2>
+      <table class="tbl" id="tradesTable">
+        <thead><tr><th>Цикл</th><th>#</th><th>Время</th><th>Цена входа</th><th>Объём, $</th>
+          <th>Кол-во</th><th>Множитель</th><th>Цена выхода</th><th>P/L, $</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ============================================================= backtest -->
+  <section class="panel" id="tab-backtest">
+    <div class="box">
+      <div class="box-head"><h2>Проверка стратегии на реальной истории</h2>
+        <span class="muted">те же настройки и тот же код, что и в торговле</span>
+      </div>
+      <div id="btHint" class="hint-banner hidden"></div>
+      <div class="bt-sources">
+        <div class="bt-source">
+          <h3>1. Свечи с биржи Gate.io</h3>
+          <p class="muted">Данные качает сам сервер прямо с биржи (публичный API, API-ключи не нужны) —
+          вам не нужно ничего искать и загружать. Даты — в UTC.</p>
+          <div class="bt-form" id="btForm"></div>
+        </div>
+        <div class="bt-source">
+          <h3>2. Или свои свечи (CSV / ZIP-архив)</h3>
+          <p class="muted">Подойдёт любой файл со свечами: <b>CSV</b> с колонками
+          <code>ts,open,high,low,close,volume</code> (выгрузка Gate.io, TradingView, Excel)
+          или <b>ZIP/GZIP-архив</b> с CSV внутри — например месячные выгрузки Binance
+          с <code>data.binance.vision</code>: их можно не распаковывать. Понимаем разделитель
+          «,» и «;», время секундами, миллисекундами, микросекундами или датой, лишние колонки
+          игнорируем. Файл остаётся на сервере и годится для повторных прогонов.</p>
+          <div class="row">
+            <input type="file" id="btFile" accept=".csv,.txt,.zip,.gz,text/csv,application/zip,application/gzip">
+            <button class="btn btn-small" id="btnUploadCsv">Загрузить на сервер</button>
+          </div>
+          <div id="btFiles" class="bt-files"></div>
+        </div>
+      </div>
+      <div class="row">
+        <button class="btn btn-green" id="btnRunBacktest">Скачать и запустить</button>
+        <button class="btn btn-small" id="btnRunCsv">Запустить на выбранном файле</button>
+        <button class="btn btn-small" id="btnRunSynthetic">Синтетика (без интернета)</button>
+        <button class="btn btn-small" id="btnCancelBacktest" disabled>Отменить</button>
+        <span class="muted" id="btStatus"></span>
+      </div>
+      <div class="progress"><div class="progress-bar" id="btProgressBar"></div></div>
+    </div>
+
+    <div class="cards" id="btStats"></div>
+    <div class="grid2">
+      <div class="box"><h2>Кривая доходности</h2><div id="btEquity" class="chart chart-small"></div></div>
+      <div class="box"><h2>График сделок</h2><div id="btChart" class="chart chart-small"></div></div>
+    </div>
+    <div class="box">
+      <h2>Циклы бэктеста</h2>
+      <p class="muted" id="btDataInfo"></p>
+      <table class="tbl" id="btCycles"><thead><tr><th>#</th><th>Сторона</th><th>Позиций</th><th>Средняя</th>
+        <th>Цель</th><th>Цена выхода</th><th>Объём, $</th><th>P/L, $</th><th>P/L, %</th><th>Причина</th></tr></thead>
+        <tbody></tbody></table>
+    </div>
+  </section>
+
+  <!-- ============================================================= settings -->
+  <section class="panel" id="tab-settings">
+    <div class="box">
+      <div class="box-head"><h2>Настройки бота</h2>
+        <div class="row">
+          <button class="btn btn-small" id="btnTestApi">Проверить подключение</button>
+          <button class="btn btn-green" id="btnSaveSettings">Сохранить</button>
+        </div>
+      </div>
+      <div id="connResult" class="hint-banner hidden"></div>
+      <div id="settingsForm" class="settings-form"></div>
+      <p class="muted">API-ключи хранятся в локальной базе данных на сервере
+      (<code>data/planb.sqlite3</code>), доступ к панели можно закрыть логином/паролем
+      через переменные окружения <code>PLANB_AUTH_USER</code> и <code>PLANB_AUTH_PASSWORD</code>.</p>
+    </div>
+    <div class="box">
+      <h2>Ограничение по API-ключу</h2>
+      <div class="legend">
+        <p>Создайте ключ в Gate.io: <b>API Management → API v4 Keys</b>. Для торговли на фьючерсах
+        достаточно прав <code>Futures – Trade</code> (и <code>Read</code> для чтения баланса), для спота —
+        <code>Spot – Trade</code>. <b>Не включайте</b> вывод средств (Withdraw) и передачу. По возможности
+        ограничьте ключ вашим IP-адресом сервера.</p>
+        <p>Начните с режима <b>paper</b> (виртуальные сделки на реальных данных) — так вы увидите, как бот
+        работает на ваших настройках, без риска.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================================================================= logs -->
+  <section class="panel" id="tab-logs">
+    <div class="box">
+      <div class="box-head"><h2>Журнал событий</h2>
+        <div class="row"><label class="switch"><input type="checkbox" id="chkAutoscroll" checked> Автопрокрутка</label>
+        <button class="btn btn-small" id="btnClearLogs">Очистить</button></div>
+      </div>
+      <div id="logs" class="logs"></div>
+    </div>
+  </section>
+</main>
+
+<div id="boot" class="boot">
+  <div class="boot-card">
+    <div class="boot-spinner"></div>
+    <h2>Загрузка панели PlanB…</h2>
+    <p class="muted">Если страница не открылась, ниже появится причина и подсказка.</p>
+    <div id="bootError" class="boot-error hidden"></div>
+  </div>
+</div>
+<noscript>
+  <div class="boot"><div class="boot-card"><h2>Нужен JavaScript</h2>
+  <p class="muted">Панель PlanB работает в браузере — включите JavaScript.</p></div></div>
+</noscript>
+<div id="toast" class="toast hidden"></div>
+<script src="static/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,22 @@
+[Unit]
+Description=PlanB — Fibonacci trading bot for Gate.io (web panel)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=planb
+Group=planb
+WorkingDirectory=/opt/planb
+EnvironmentFile=/opt/planb/.env
+ExecStart=/opt/planb/.venv/bin/python run.py
+Restart=always
+RestartSec=5
+# базовая изоляция
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/opt/planb/data
+
+[Install]
+WantedBy=multi-user.target

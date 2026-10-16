@@ -1,0 +1,16 @@
+services:
+  planb:
+    build: .
+    container_name: planb
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data          # база данных: настройки, сделки, журнал
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
