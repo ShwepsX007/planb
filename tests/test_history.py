@@ -383,3 +383,13 @@ async def test_test_connection_without_keys_checks_public_data(client: httpx.Asy
 
     synth = await client.post("/api/settings/test-connection", json={"data_source": "synthetic"})
     assert synth.json()["synthetic"] is True
+
+
+async def test_live_trading_on_synthetic_data_is_rejected(client: httpx.AsyncClient):
+    """Нельзя торговать реальными деньгами по выдуманным свечам."""
+    res = await client.put("/api/settings", json={"data_source": "synthetic", "trade_mode": "live"})
+    assert res.status_code == 422
+    assert "выдуманных свечах" in res.text
+    ok = await client.put("/api/settings", json={"data_source": "synthetic", "trade_mode": "paper"})
+    assert ok.status_code == 200
+    assert ok.json()["settings"]["data_source"] == "synthetic"

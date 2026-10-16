@@ -126,6 +126,10 @@ class BotSettings(BaseModel):
             self.multiplier_start_position = self.max_positions
         if self.market_type == "spot" and self.direction == "short":
             self.direction = "long"
+        if self.trade_mode == "live" and self.synthetic_data:
+            raise ValueError(
+                "нельзя торговать реальными деньгами (live) на выдуманных свечах: выберите "
+                "источник данных Gate.io или режим paper")
         return self
 
     @property

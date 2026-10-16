@@ -180,30 +180,21 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
    <code>systemctl restart planb</code></p>
 </div></body></html>"""
         return Response(status_code=401, media_type="text/html; charset=utf-8",
-                        headers={"WWW-Authenticate": 'Basic realm="PlanB", charset="UTF-8"'},
+                        headers={"WWW-Authenticate": 'Basic realm="PlanB", charset="UTF-8"',
+                                 "Cache-Control": "no-store, must-revalidate"},
                         content=html)
 
     app = FastAPI(title="PlanB — Fibonacci bot for Gate.io", version=__version__,
                   docs_url="/api/docs", openapi_url="/api/openapi.json")
 
     @app.middleware("http")
-    async def no_cache_middleware(request: Request, call_next):
-        """Запрещаем браузеру держать старую версию страницы.
+    async def auth_and_cache_middleware(request: Request, call_next):
+        """Авторизация панели + запрет кеша на страницы и API.
 
-        Из-за кеша «белый экран» оставался виден даже после исправления на сервере.
-        Страница и API всегда берутся заново, статика — с проверкой изменений.
+        Кеш важен отдельно: из-за него браузер показывал старую (в том числе пустую)
+        версию страницы даже после исправления на сервере. Теперь страница и API всегда
+        берутся заново, а статика — с проверкой изменений на сервере.
         """
-        response = await call_next(request)
-        path = request.url.path
-        if path.startswith("/static/"):
-            response.headers.setdefault("Cache-Control", "no-cache, must-revalidate")
-        else:
-            response.headers.setdefault("Cache-Control", "no-store, must-revalidate")
-            response.headers.setdefault("Pragma", "no-cache")
-        return response
-
-    @app.middleware("http")
-    async def auth_middleware(request: Request, call_next):
         path = request.url.path
         # открытыми остаются: /api/health (мониторинг, healthcheck Docker)
         # и /static (скрипты/стили панели) — иначе браузер не покажет даже страницу входа
@@ -211,7 +202,13 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
         if auth_pass and protected and _needs_auth(request.headers.get("authorization")):
             reason = "wrong" if request.headers.get("authorization") else "auth"
             return _auth_page(reason)
-        return await call_next(request)
+        response = await call_next(request)
+        if path.startswith("/static/"):
+            response.headers.setdefault("Cache-Control", "no-cache, must-revalidate")
+        else:
+            response.headers.setdefault("Cache-Control", "no-store, must-revalidate")
+            response.headers.setdefault("Pragma", "no-cache")
+        return response
 
     # ------------------------------------------------------------------ static
     if WEB_DIR.exists():

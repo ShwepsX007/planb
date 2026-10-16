@@ -120,3 +120,24 @@ async def test_health_returns_json_for_monitoring(client):
     # без заголовка Accept (curl, healthcheck) тоже JSON
     res = await client.get("/api/health")
     assert res.headers["content-type"].startswith("application/json")
+
+
+async def test_401_page_is_not_cached(tmp_path, monkeypatch):
+    """Страница входа тоже без кеша: иначе браузер залипает на старом ответе."""
+    import os
+    import httpx
+    from app.main import create_app
+    monkeypatch.setenv("PLANB_AUTH_USER", "admin")
+    monkeypatch.setenv("PLANB_AUTH_PASSWORD", "pass123")
+    app = create_app(os.path.join(str(tmp_path), "cache.sqlite3"))
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
+                                 base_url="http://test") as client:
+        res = await client.get("/")
+        assert res.status_code == 401
+        assert "no-store" in res.headers.get("cache-control", "")
+        assert "Basic" in res.headers.get("www-authenticate", "")
+        ok = await client.get("/", auth=("admin", "pass123"))
+        assert ok.status_code == 200
+        assert "no-store" in ok.headers.get("cache-control", "")
+        static = await client.get("/static/app.js")
+        assert "no-cache" in static.headers.get("cache-control", "")
