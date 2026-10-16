@@ -208,6 +208,11 @@ if [ -n "$PLANB_PRESET" ]; then
 fi
 chmod 600 "$PLANB_DIR/.env"
 note "порт $PLANB_PORT, база $PLANB_DIR/data/planb.sqlite3"
+if printf '%s' "$PLANB_AUTH_PASSWORD" | LC_ALL=C grep -q '[^ -~]'; then
+    warn "в пароле есть не-ASCII символы (например кириллица). Он поддерживается, но если
+      браузер капризничает — задайте пароль из латиницы и цифр:
+      PLANB_AUTH_PASSWORD='novy-parol123' bash $PLANB_DIR/deploy/install.sh"
+fi
 [ -n "$PLANB_PRESET" ] && note "пресет данных: $PLANB_PRESET (демо-рынок; реальные данные включаются в панели)"
 
 # ---------------------------------------------------------------- 5. systemd
@@ -261,8 +266,19 @@ if [ "$OK" != "1" ]; then
     die "проверьте ошибки выше (частая причина — занятый порт или нет доступа в интернет)"
 fi
 
-HEALTH="$(curl -fsS -u "${PLANB_AUTH_USER}:${PLANB_AUTH_PASSWORD}" \
-    "http://127.0.0.1:${PLANB_PORT}/api/health" || true)"
+HEALTH="$(curl -fsS "http://127.0.0.1:${PLANB_PORT}/api/health" || true)"
+
+# страница панели и её ресурсы — именно то, что открывает браузер
+PANEL_CODE="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
+    -u "${PLANB_AUTH_USER}:${PLANB_AUTH_PASSWORD}" "http://127.0.0.1:${PLANB_PORT}/" || echo 000)"
+ASSET_CODE="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
+    "http://127.0.0.1:${PLANB_PORT}/static/app.js" || echo 000)"
+if [ "$PANEL_CODE" = "200" ] && [ "$ASSET_CODE" = "200" ]; then
+    note "страница панели отдаётся (200), статика отдаётся (200)"
+else
+    warn "проверка страницы не прошла: / -> $PANEL_CODE, /static/app.js -> $ASSET_CODE"
+    note "диагностика: bash $PLANB_DIR/deploy/check.sh"
+fi
 IP="$( (hostname -I 2>/dev/null | awk '{print $1}') || echo 'IP_сервера')"
 
 # --------------------------------------------------------------- 7. firewall
@@ -313,6 +329,14 @@ ${C_OK}Готово.${C_OFF}  Сервис: $SERVICE_NAME   Порт: $PLANB_POR
 
   Проверка вручную:
     curl -u $PLANB_AUTH_USER:$PLANB_AUTH_PASSWORD http://127.0.0.1:$PLANB_PORT/api/health
+
+  Если браузер показывает пустой экран:
+    1) сначала: bash $PLANB_DIR/deploy/check.sh   — скрипт проверит всё по шагам;
+    2) наберите адрес строго по http:// и с портом: http://<IP>:${PLANB_PORT}/ ;
+    3) проверьте с рабочего компьютера: curl -v --max-time 6 http://<IP>:${PLANB_PORT}/api/health
+       — если виснет, порт закрыт в файрволе или Security Group облака;
+    4) если порт закрыть нельзя — опубликуйте панель через уже работающий nginx:
+       bash $PLANB_DIR/deploy/setup-nginx.sh        (адрес вида http://ДОМЕН/planb/)
 
   Работа рядом с другими проектами:
     • занят только порт $PLANB_PORT (проверить: ss -ltnp | grep ${PLANB_PORT});

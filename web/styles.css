@@ -132,3 +132,16 @@ input:focus,select:focus{outline:none;border-color:#35507a}
   .topbar{gap:10px}
   .status-cluster{margin-left:0}
 }
+
+/* --------------------------------------------------- стартовый экран панели */
+.boot{position:fixed;inset:0;background:var(--bg);display:grid;place-items:center;z-index:100}
+.boot.hidden{display:none}
+.boot-card{max-width:560px;padding:26px 30px;background:var(--bg2);border:1px solid var(--line);
+  border-radius:12px;text-align:center}
+.boot-card h2{font-size:16px;margin:12px 0 8px;text-transform:none;letter-spacing:0}
+.boot-spinner{width:26px;height:26px;margin:0 auto;border:3px solid #243146;border-top-color:var(--green);
+  border-radius:50%;animation:spin 1s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.boot-error{margin-top:14px;padding:12px 14px;border-radius:8px;background:rgba(255,92,92,.12);
+  border:1px solid rgba(255,92,92,.4);color:#ffb4b4;font-size:13px;text-align:left;line-height:1.5}
+.boot-error code{color:#ffd479}

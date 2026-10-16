@@ -72,18 +72,83 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
     auth_user = os.environ.get("PLANB_AUTH_USER", "").strip()
     auth_pass = os.environ.get("PLANB_AUTH_PASSWORD", "").strip()
 
+    def _decode_credentials(raw: bytes) -> list:
+        """Basic-auth приходит в разных кодировках: UTF-8 (RFC 7617) или Latin-1
+        (старые браузеры, Windows-1251 в русских паролях). Пробуем все варианты,
+        чтобы «кириллический» пароль работал в любом браузере."""
+        variants = []
+        for encoding in ("utf-8", "cp1251", "latin-1"):
+            try:
+                variants.append(raw.decode(encoding))
+            except (UnicodeDecodeError, LookupError):
+                continue
+        return variants
+
+    def _secure_equal(a: str, b: str) -> bool:
+        """Сравнение без утечек по времени.
+
+        Важно: ``secrets.compare_digest`` для строк бросает TypeError на не-ASCII
+        символах (например, если пароль на кириллице). Сравниваем байты — тогда
+        работают пароли в любой кодировке.
+        """
+        try:
+            return secrets.compare_digest(a.encode("utf-8"), b.encode("utf-8"))
+        except Exception:
+            return False
+
     def _check_auth(header: Optional[str]) -> bool:
         if not auth_pass:
             return True
         if not header or not header.startswith("Basic "):
             return False
         try:
-            raw = base64.b64decode(header[6:]).decode("utf-8")
+            raw = base64.b64decode(header[6:], validate=False)
         except Exception:
             return False
-        user, _, pwd = raw.partition(":")
         expect_user = auth_user or "admin"
-        return secrets.compare_digest(user, expect_user) and secrets.compare_digest(pwd, auth_pass)
+        for decoded in _decode_credentials(raw):
+            user, _, pwd = decoded.partition(":")
+            if _secure_equal(user, expect_user) and _secure_equal(pwd, auth_pass):
+                return True
+        return False
+
+    def _needs_auth(header: Optional[str]) -> bool:
+        return bool(auth_pass) and not _check_auth(header)
+
+    def _auth_page(reason: str = "auth") -> Response:
+        """Читаемая страница вместо «белого экрана» при 401."""
+        if reason == "wrong":
+            title, hint = "Неверный логин или пароль", (
+                "Браузер отправил логин и пароль, но они не совпадают с настройками бота. "
+                "Проверьте их в файле <code>.env</code> рядом с ботом "
+                "(переменные <code>PLANB_AUTH_USER</code> и <code>PLANB_AUTH_PASSWORD</code>).")
+        else:
+            title, hint = "Требуется авторизация", (
+                "Введите логин и пароль панели (см. <code>PLANB_AUTH_USER</code> и "
+                "<code>PLANB_AUTH_PASSWORD</code> в файле <code>.env</code>). "
+                "Если окно с паролем не появилось — обновите страницу или откройте панель "
+                "в приватном окне браузера.")
+        html = f"""<!DOCTYPE html>
+<html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PlanB — {title}</title>
+<style>
+ body{{margin:0;min-height:100vh;display:grid;place-items:center;background:#0d1117;color:#e6edf3;
+   font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif}}
+ .card{{max-width:520px;padding:28px 32px;background:#131a23;border:1px solid #243146;border-radius:12px}}
+ h1{{font-size:18px;margin:0 0 10px}} p{{margin:0 0 10px;color:#c6d2df}}
+ code{{background:#0b1017;padding:2px 6px;border-radius:4px;font-size:13px;color:#ffd479}}
+ .muted{{color:#8b98a9;font-size:13px}} a{{color:#4da3ff}}
+</style></head><body><div class="card">
+ <h1>{title}</h1><p>{hint}</p>
+ <p class="muted">Проверка без браузера:<br>
+   <code>curl -u ЛОГИН:ПАРОЛЬ http://127.0.0.1:ПОРТ/api/health</code></p>
+ <p class="muted">Пароль можно сменить в файле <code>.env</code> и перезапустить сервис:
+   <code>systemctl restart planb</code></p>
+</div></body></html>"""
+        return Response(status_code=401, media_type="text/html; charset=utf-8",
+                        headers={"WWW-Authenticate": 'Basic realm="PlanB", charset="UTF-8"'},
+                        content=html)
 
     app = FastAPI(title="PlanB — Fibonacci bot for Gate.io", version=__version__,
                   docs_url="/api/docs", openapi_url="/api/openapi.json")
@@ -91,12 +156,12 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
     @app.middleware("http")
     async def auth_middleware(request: Request, call_next):
         path = request.url.path
-        # /api/health остаётся открытым для мониторинга и healthcheck Docker
+        # открытыми остаются: /api/health (мониторинг, healthcheck Docker)
+        # и /static (скрипты/стили панели) — иначе браузер не покажет даже страницу входа
         protected = path == "/" or (path.startswith("/api") and path != "/api/health")
-        if auth_pass and protected:
-            if not _check_auth(request.headers.get("authorization")):
-                return Response(status_code=401, headers={"WWW-Authenticate": 'Basic realm="PlanB"'},
-                                content="Требуется авторизация")
+        if auth_pass and protected and _needs_auth(request.headers.get("authorization")):
+            reason = "wrong" if request.headers.get("authorization") else "auth"
+            return _auth_page(reason)
         return await call_next(request)
 
     # ------------------------------------------------------------------ static
@@ -255,6 +320,8 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
     # -------------------------------------------------------------- websocket
     @app.websocket("/ws")
     async def ws_endpoint(websocket: WebSocket):
+        # браузеры отправляют Basic-заголовок и при WebSocket-рукопожатии;
+        # если пароль не проходит — панель работает на опросе /api/state
         if auth_pass and not _check_auth(websocket.headers.get("authorization")):
             await websocket.close(code=4401)
             return

@@ -163,6 +163,9 @@ setTimeout(async () => {
 
   check('WebSocket подключён по правильному пути',
     window.__wsUrl && window.__wsUrl.endsWith(EXPECTED_BASE + 'ws'), window.__wsUrl);
+  check('стартовый экран скрывается после загрузки',
+    $('boot') && $('boot').classList.contains('hidden'),
+    $('boot') ? 'классы: ' + $('boot').className : 'нет элемента #boot');
   check('нет необработанных ошибок', errors.length === 0, errors.join(' | '));
   console.log(process.exitCode ? '\nПРОВЕРКА ПРОВАЛЕНА' : '\nПанель работает: все проверки пройдены');
   process.exit(process.exitCode || 0);

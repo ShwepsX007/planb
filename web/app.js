@@ -24,17 +24,31 @@ const app = {
 
 /* ------------------------------------------------------------------ helpers */
 async function api(method, path, body) {
-  const res = await fetch(BASE + path.replace(/^\//, ''), {
-    method,
-    headers: body ? { 'Content-Type': 'application/json' } : {},
-    body: body ? JSON.stringify(body) : undefined,
-  });
+  let res;
+  try {
+    res = await fetch(BASE + path.replace(/^\//, ''), {
+      method,
+      headers: body ? { 'Content-Type': 'application/json' } : {},
+      body: body ? JSON.stringify(body) : undefined,
+      credentials: 'same-origin',
+    });
+  } catch (e) {
+    const err = new Error('нет связи с сервером бота');
+    err.network = true;
+    throw err;
+  }
   const text = await res.text();
   let data = null;
   try { data = text ? JSON.parse(text) : null; } catch (e) { data = { raw: text }; }
   if (!res.ok) {
-    const err = data && data.error ? (typeof data.error === 'string' ? data.error : JSON.stringify(data.error)) : res.statusText;
-    throw new Error(err);
+    let msg = data && data.error
+      ? (typeof data.error === 'string' ? data.error : JSON.stringify(data.error))
+      : (res.statusText || ('HTTP ' + res.status));
+    if (res.status === 401) msg = 'нужна авторизация (логин и пароль панели)';
+    if (res.status === 404) msg = 'обработчик не найден — проверьте префикс пути (nginx)';
+    const err = new Error(msg);
+    err.status = res.status;
+    throw err;
   }
   return data;
 }
@@ -662,6 +676,41 @@ function switchTab(name) {
   if (app.btChart) app.btChart.applyOptions({ width: $('btChart').clientWidth });
 }
 
+function bootDone() {
+  const boot = $('boot');
+  if (boot) boot.classList.add('hidden');
+}
+
+function bootFail(error) {
+  const boot = $('boot');
+  const box = $('bootError');
+  if (!boot || !box) return;
+  const spinner = boot.querySelector('.boot-spinner');
+  if (spinner) spinner.style.display = 'none';
+  const title = boot.querySelector('h2');
+  if (title) title.textContent = 'Панель не смогла подключиться к боту';
+  let extra = '';
+  if (error && error.status === 401) {
+    extra = 'Введите логин и пароль панели (переменные <code>PLANB_AUTH_USER</code> и ' +
+      '<code>PLANB_AUTH_PASSWORD</code> в файле <code>.env</code> рядом с ботом). ' +
+      'Если окно с паролем не появляется — откройте страницу в приватном окне браузера.';
+  } else if (error && (error.network || error.status === undefined)) {
+    extra = 'Браузер не получил ответ от бота. Проверьте на сервере:<br>' +
+      '<code>systemctl status planb</code> и <code>ss -ltnp | grep 8015</code>, ' +
+      'а также что порт открыт в файрволе и Security Group облака.<br>' +
+      'Проверка с вашего компьютера: <code>curl -v http://СЕРВЕР:ПОРТ/</code> — ' +
+      'если соединение зависает, порт закрыт снаружи.<br>' +
+      'На сервере есть готовый диагностический скрипт: ' +
+      '<code>bash /root/planb/deploy/check.sh</code>.';
+  } else if (error && error.status === 404) {
+    extra = 'Сервер ответил 404: проверьте настройку nginx (пример для префикса /planb/ — в README).';
+  } else {
+    extra = 'Ответ сервера: <code>' + escapeHtml(error ? error.message : 'неизвестная ошибка') + '</code>';
+  }
+  box.innerHTML = '<b>' + escapeHtml(error ? error.message : 'ошибка') + '</b><br>' + extra;
+  box.classList.remove('hidden');
+}
+
 async function init() {
   document.querySelectorAll('.tab').forEach((t) => t.addEventListener('click', () => switchTab(t.dataset.tab)));
   $('btnStart').onclick = () => botAction('/api/bot/start', 'Старт');
@@ -693,19 +742,28 @@ async function init() {
     await loadSettings();
     app.snapshot = await api('GET', '/api/state');
     renderSnapshot(app.snapshot);
-  } catch (e) { toast('Не удалось загрузить состояние: ' + e.message, 'err'); }
+    bootDone();
+  } catch (e) {
+    bootFail(e);
+    toast('Не удалось загрузить состояние: ' + e.message, 'err');
+  }
 
   const logs = await api('GET', '/api/logs?limit=200').catch(() => ({ logs: [] }));
   (logs.logs || []).forEach(pushLog);
   connectWS();
   loadHistory();
   // страховка: если WebSocket недоступен (прокси/авторизация) — опрашиваем API
+  let failures = 0;
   setInterval(async () => {
     if (app.ws && app.ws.readyState === 1) return;
     try {
       app.snapshot = await api('GET', '/api/state');
       renderSnapshot(app.snapshot);
-    } catch (e) { /* сервер недоступен */ }
+      failures = 0;
+    } catch (e) {
+      failures += 1;
+      if (failures === 3) bootFail(e);      // сервер пропал — покажем причину
+    }
   }, 3000);
 }
 
