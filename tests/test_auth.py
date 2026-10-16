@@ -102,3 +102,21 @@ def test_password_comparison_helper_handles_any_encoding():
     # строковая версия падала бы с TypeError — фиксируем это как причину баг-фикса
     with pytest.raises(TypeError):
         _secrets.compare_digest("придумай-пароль", "придумай-пароль")
+
+
+async def test_health_returns_html_page_in_browser(client):
+    """Открыли /api/health в браузере — покажем ссылку на панель, а не сухой JSON."""
+    res = await client.get("/api/health", headers={"Accept": "text/html,application/xhtml+xml"})
+    assert res.status_code == 200
+    assert res.headers["content-type"].startswith("text/html")
+    assert "Открыть панель" in res.text
+    assert 'href="../"' in res.text          # относительная ссылка -> работает и за префиксом nginx
+
+
+async def test_health_returns_json_for_monitoring(client):
+    res = await client.get("/api/health", headers={"Accept": "application/json"})
+    assert res.status_code == 200
+    assert res.json()["ok"] is True
+    # без заголовка Accept (curl, healthcheck) тоже JSON
+    res = await client.get("/api/health")
+    assert res.headers["content-type"].startswith("application/json")

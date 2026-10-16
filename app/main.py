@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import ValidationError
 
@@ -177,7 +177,48 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
 
     # -------------------------------------------------------------------- api
     @app.get("/api/health")
-    async def health():
+    async def health(request: Request):
+        """Проверка живости. Для мониторинга — JSON, для браузера — подсказка.
+
+        Частая путаница: этот служебный адрес открывают в браузере вместо панели.
+        В этом случае вместо сухого JSON отдаём страницу с кнопкой «Открыть панель».
+        """
+        accept = (request.headers.get("accept") or "").lower()
+        if "text/html" in accept:
+            status = runtime.status
+            labels = {"running": "бот работает", "stopped": "бот остановлен",
+                      "paused": "пауза", "error": "ошибка",
+                      "target_reached": "цель по профиту достигнута",
+                      "stopped_by_stop_loss": "остановлен стоп-лоссом"}
+            hint = ""
+            if status == "stopped":
+                hint = ("<p>Бот ещё не запущен. Откройте панель и нажмите <b>«Старт»</b> — "
+                        "по умолчанию включён демо-режим, ключи биржи не нужны.</p>")
+            html = f"""<!DOCTYPE html>
+<html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PlanB — служебный адрес</title>
+<style>
+ body{{margin:0;min-height:100vh;display:grid;place-items:center;background:#0d1117;color:#e6edf3;
+   font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif}}
+ .card{{max-width:560px;padding:28px 32px;background:#131a23;border:1px solid #243146;border-radius:12px}}
+ h1{{font-size:18px;margin:0 0 10px}} p{{margin:0 0 12px;color:#c6d2df}}
+ a.button{{display:inline-block;margin:6px 0 14px;padding:11px 18px;border-radius:8px;
+   background:#1d7a45;color:#eafff2;text-decoration:none;font-weight:600}}
+ code{{background:#0b1017;padding:2px 6px;border-radius:4px;font-size:13px;color:#ffd479}}
+ .muted{{color:#8b98a9;font-size:13px}}
+</style></head><body><div class="card">
+ <h1>Это служебный адрес <code>/api/health</code></h1>
+ <p>Здесь для систем мониторинга отдаётся JSON: <code>{{"ok":true,"status":"{status}"}}</code>
+    (сейчас: {labels.get(status, status)}).</p>
+ <p><b>Панель управления ботом находится по адресу без пути:</b></p>
+ <p><a class="button" href="../">Открыть панель PlanB →</a></p>
+ {hint}
+ <p class="muted">Если браузер спрашивает логин и пароль — они заданы в файле
+   <code>.env</code> рядом с ботом (<code>PLANB_AUTH_USER</code>, <code>PLANB_AUTH_PASSWORD</code>)
+   либо посмотрите их командой <code>bash deploy/set-auth.sh --show</code>.</p>
+</div></body></html>"""
+            return HTMLResponse(html)
         return {"ok": True, "version": __version__, "status": runtime.status}
 
     @app.get("/api/state")

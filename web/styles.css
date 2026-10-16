@@ -145,3 +145,11 @@ input:focus,select:focus{outline:none;border-color:#35507a}
 .boot-error{margin-top:14px;padding:12px 14px;border-radius:8px;background:rgba(255,92,92,.12);
   border:1px solid rgba(255,92,92,.4);color:#ffb4b4;font-size:13px;text-align:left;line-height:1.5}
 .boot-error code{color:#ffd479}
+
+/* ------------------------------------------------- подсказка о состоянии */
+.hint-banner{margin-bottom:14px;padding:12px 16px;border-radius:10px;font-size:13.5px;line-height:1.55;
+  background:#16202c;border:1px solid #2b3a4f;color:#cbd5e1}
+.hint-banner.warn{background:rgba(240,185,11,.10);border-color:rgba(240,185,11,.4)}
+.hint-banner.ok{background:rgba(46,204,113,.10);border-color:rgba(46,204,113,.35)}
+.hint-banner.err{background:rgba(255,92,92,.10);border-color:rgba(255,92,92,.4)}
+.hint-banner b{color:#eaf2ff}

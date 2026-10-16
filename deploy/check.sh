@@ -97,14 +97,60 @@ EXT_IP="$(curl -s --max-time 5 https://api.ipify.org || hostname -I 2>/dev/null 
 info "внешний IP этого сервера: ${EXT_IP:-неизвестен}"
 CODE_EXT="$(curl -s -o /dev/null -w '%{http_code}' --max-time 6 "http://${EXT_IP:-127.0.0.1}:${PORT}/api/health" || echo 000)"
 if [ "$CODE_EXT" = "200" ]; then
-    ok "по внешнему адресу отвечает: http://${EXT_IP}:${PORT}/api/health"
+    ok "локально по внешнему адресу отвечает: http://${EXT_IP}:${PORT}/api/health"
+    info "важно: эта проверка идёт с самого сервера и НЕ доказывает, что порт открыт"
+    info "наружу (Security Group облака может блокировать внешних клиентов)."
 else
     note_problem "по внешнему адресу ответа нет ($CODE_EXT). Проверьте файрвол и Security Group облака:"
     info "  ufw: ufw status; открыть: ufw allow ${PORT}/tcp"
     info "  firewalld: firewall-cmd --state; открыть: firewall-cmd --permanent --add-port=${PORT}/tcp && firewall-cmd --reload"
     info "  iptables: iptables -S | grep ${PORT}"
     info "  облако: правило Ingress TCP ${PORT} в Security Group (панель провайдера)"
-    info "  проверка с вашего компьютера: curl -v --max-time 6 http://${EXT_IP}:${PORT}/api/health"
+fi
+
+# реальная проверка снаружи через независимый сервис (если есть доступ в интернет)
+if command -v python3 >/dev/null 2>&1 && [ -n "${EXT_IP:-}" ]; then
+    info "проверяю доступность ${PORT} с внешнего узла (check-host.net)…"
+    REQ_ID="$(curl -s --max-time 8 -H 'Accept: application/json' \
+        "https://check-host.net/check-tcp?host=${EXT_IP}:${PORT}&max_nodes=3" \
+        | python3 -c 'import json,sys;print(json.load(sys.stdin).get("request_id",""))' 2>/dev/null || true)"
+    if [ -n "$REQ_ID" ]; then
+        sleep 8
+        RESULT="$(curl -s --max-time 8 -H 'Accept: application/json' \
+            "https://check-host.net/check-result/${REQ_ID}" || true)"
+        STATS="$(printf '%s' "$RESULT" | python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    print("0 0"); raise SystemExit
+ok = bad = 0
+for value in (data or {}).values():
+    if value is None:
+        continue
+    if isinstance(value, list) and value and isinstance(value[0], dict) and value[0].get("time") is not None:
+        ok += 1
+    else:
+        bad += 1
+print(f"{ok} {bad}")
+' 2>/dev/null || echo "0 0")"
+        OK_NODES="${STATS%% *}"; BAD_NODES="${STATS##* }"
+        if [ "${OK_NODES:-0}" -gt 0 ] 2>/dev/null; then
+            ok "порт $PORT доступен из интернета (успешных проверок: $OK_NODES)"
+        elif [ "${BAD_NODES:-0}" -gt 0 ] 2>/dev/null; then
+            note_problem "из интернета порт $PORT недоступен (неудачных проверок: $BAD_NODES)"
+            info "  это работающий порт на сервере, но внешние подключения не доходят —"
+            info "  почти всегда это Security Group облака (правило Ingress TCP $PORT)."
+            info "  вариант без открытия порта — публикация через уже работающий nginx:"
+            info "    bash $PLANB_DIR/deploy/setup-nginx.sh     # адрес вида http://ДОМЕН/planb/"
+        else
+            info "внешний сервис не дал результат — проверьте вручную с домашнего компьютера:"
+            info "  curl -v --max-time 8 http://${EXT_IP}:${PORT}/api/health"
+        fi
+    else
+        info "внешний сервис недоступен с этого сервера — проверьте вручную с домашнего компьютера:"
+        info "  curl -v --max-time 8 http://${EXT_IP}:${PORT}/api/health"
+    fi
 fi
 if command -v ufw >/dev/null 2>&1; then
     info "ufw: $(ufw status 2>/dev/null | head -1 || echo 'недоступен')"
@@ -168,13 +214,16 @@ if [ "$PROBLEMS" -eq 0 ]; then
     printf '  \033[1;32mВсё в порядке.\033[0m Панель: http://%s:%s/  (логин: %s, пароль: %s)\n\n' \
         "${EXT_IP:-СЕРВЕР}" "$PORT" "${AUTH_USER:-admin}" "${AUTH_PASS:-без пароля}"
     cat <<EOF
-  Если в браузере «белый экран», проверьте по порядку:
-    1) адрес набран по http:// (не https://) и с портом:  http://${EXT_IP:-СЕРВЕР}:${PORT}/
-    2) браузер должен спросить логин и пароль. Пароль лежит в $ENV_FILE
-       (переменная PLANB_AUTH_PASSWORD). Если окно не появляется — приватное окно браузера.
-    3) откройте http://${EXT_IP:-СЕРВЕР}:${PORT}/api/health — должно быть {"ok":true,...}
-    4) если /api/health открывается, а панель нет — пришлите текст ошибки с экрана:
-       панель теперь пишет причину прямо на странице.
+  Как открыть панель в браузере:
+    1) адрес панели — КОРЕНЬ, без пути:   http://${EXT_IP:-СЕРВЕР}:${PORT}/
+       (адрес .../api/health открывать не нужно — там служебный JSON; если откроете его
+        в браузере, страница сама предложит ссылку на панель)
+    2) лучше в приватном окне — чтобы браузер не подставил сохранённый старый пароль;
+    3) логин: ${AUTH_USER:-admin}, пароль: ${AUTH_PASS:-не задан} (файл $ENV_FILE);
+    4) сменить пароль:  bash $PLANB_DIR/deploy/set-auth.sh 'novy-parol123'
+       отключить пароль: bash $PLANB_DIR/deploy/set-auth.sh --off
+       посмотреть доступ: bash $PLANB_DIR/deploy/set-auth.sh --show
+    5) если не открывается — пришлите текст с экрана: панель пишет причину прямо на странице.
 EOF
 else
     printf '  \033[1;33mНайдено проблем: %s.\033[0m Смотрите пункты, отмеченные [!!].\n\n' "$PROBLEMS"

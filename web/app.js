@@ -64,19 +64,35 @@ function toast(message, kind = 'ok') {
 /* ---------------------------------------------------------------------- ws */
 function connectWS() {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  const ws = new WebSocket(`${proto}://${location.host}${BASE}ws`);
+  let ws;
+  try {
+    ws = new WebSocket(`${proto}://${location.host}${BASE}ws`);
+  } catch (e) {
+    scheduleWSReconnect(false);
+    return;
+  }
   app.ws = ws;
+  let opened = false;
+  ws.onopen = () => { opened = true; app.wsFailures = 0; };
   ws.onmessage = (ev) => {
     let msg = null;
     try { msg = JSON.parse(ev.data); } catch (e) { return; }
     if (msg.type === 'snapshot') { app.snapshot = msg.snapshot; renderSnapshot(msg.snapshot); }
     else if (msg.type === 'log') { pushLog(msg.log); }
   };
-  ws.onclose = () => {
-    clearTimeout(app.wsTimer);
-    app.wsTimer = setTimeout(connectWS, 2500);
-  };
-  ws.onerror = () => ws.close();
+  ws.onclose = () => { scheduleWSReconnect(opened); };
+  ws.onerror = () => { try { ws.close(); } catch (e) {} };
+}
+
+/* Если сервер закрывает рукопожатие (например панель защищена паролем и браузер
+   не передал заголовок авторизации) — не долбим сервер, а ждём дольше:
+   панель в это время обновляется обычными запросами /api/state. */
+function scheduleWSReconnect(opened) {
+  if (opened) app.wsFailures = 0;
+  app.wsFailures = (app.wsFailures || 0) + 1;
+  const delay = Math.min(30000, 2500 * app.wsFailures);
+  clearTimeout(app.wsTimer);
+  app.wsTimer = setTimeout(connectWS, delay);
 }
 
 /* ------------------------------------------------------------------ render */
@@ -134,11 +150,43 @@ function renderSnapshot(s) {
   $('cNextAdd').textContent = c && c.next_position_volume_usd ? fmt(c.next_position_volume_usd, 2) + ' $' : '—';
   $('cNextAddHint').textContent = c ? (c.next_position_idx ? `позиция #${c.next_position_idx} · осталось ${c.positions_left}` : 'лимит позиций достигнут') : '—';
 
+  renderStateHint(s, e, c);
   renderCycleBox(c, e, s);
   renderCurrentPositions(c);
   renderEngineBox(e, s, c);
   renderLogic(s);
   if (app.chartTabActive) maybeUpdateChart();
+}
+
+function renderStateHint(s, e, c) {
+  const box = $('stateHint');
+  if (!box) return;
+  let html = '';
+  let kind = '';
+  if (s.status === 'stopped' || s.status === 'error') {
+    kind = s.status === 'error' ? 'err' : 'warn';
+    html = s.status === 'error'
+      ? `<b>Бот не смог запуститься:</b> ${escapeHtml(s.error || 'см. журнал')}. ` +
+        'Проверьте журнал ниже и настройки (источник данных, ключи биржи).'
+      : '<b>Бот не запущен.</b> Нажмите <b>«Старт»</b> вверху страницы. ' +
+        'По умолчанию включён демонстрационный рынок и виртуальные сделки (paper) — ' +
+        'ключи биржи для этого не нужны. Для реальной торговли: вкладка «Настройки» → ' +
+        'источник данных Gate.io, API-ключи, режим live.';
+  } else if (s.status === 'running' && !s.price) {
+    kind = '';
+    html = 'Бот запущен и получает первые свечи — данные появятся в течение минуты.';
+  } else if (s.status === 'target_reached') {
+    kind = 'ok';
+    html = `<b>Цель по общему профиту достигнута</b> (${fmt(e.realized_pnl, 4)} $). ` +
+      'Бот остановлен. Чтобы продолжить: увеличьте цель на вкладке «Настройки» ' +
+      'или нажмите «Сбросить статистику», затем «Старт».';
+  } else if (s.status === 'stopped_by_stop_loss') {
+    kind = 'err';
+    html = '<b>Цикл закрыт аварийным стоп-лоссом</b> — проверьте журнал и параметры риска ' +
+      '(лимит позиций, минимальный профит, стоп цикла).';
+  }
+  box.className = 'hint-banner ' + kind + (html ? '' : ' hidden');
+  box.innerHTML = html;
 }
 
 function kv(rows) {
