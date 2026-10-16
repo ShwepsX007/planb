@@ -23,6 +23,10 @@ def timeframe_to_ms(timeframe: str) -> int:
     return TIMEFRAMES[timeframe] * 1000
 
 
+#: максимальный шаг реального времени, который учитывает DEMO-фид за один опрос
+MAX_REAL_STEP_SEC = 10.0
+
+
 class BaseFeed:
     name = "base"
 
@@ -183,8 +187,13 @@ class DemoFeed(BaseFeed):
 
     async def poll(self) -> tuple[List[Candle], float]:
         now = now_ms()
-        elapsed = max(0.0, (now - self._last_tick) / 1000.0) * self.speed
+        real = max(0.0, (now - self._last_tick) / 1000.0)
         self._last_tick = now
+        # защита от «прыжка» после паузы окружения (сон VPS, рестарт процесса,
+        # отладка): длительность шага ограничена, иначе демо-рынок уезжает на часы
+        if real > MAX_REAL_STEP_SEC:
+            real = MAX_REAL_STEP_SEC
+        elapsed = real * self.speed
         closed: List[Candle] = []
         remaining = elapsed
         guard = 0

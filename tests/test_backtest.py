@@ -143,3 +143,29 @@ async def test_runtime_demo_loop_trades_and_persists():
     finally:
         await runtime.stop()
     assert runtime.status == "stopped"
+
+
+# ------------------------------------------------------------- demo feed guard
+@pytest.mark.asyncio
+async def test_demo_feed_does_not_jump_after_a_long_pause():
+    """После сна окружения демо-рынок не должен уезжать на часы за один опрос."""
+    from app.feed import MAX_REAL_STEP_SEC, DemoFeed
+    import app.feed as feed_module
+
+    settings = bt_settings(timeframe="1m", demo_speed=30)
+    feed = DemoFeed(settings, speed=30)
+    price_before = feed.price
+    # имитируем паузу длиной 25 минут
+    feed._last_tick -= int(25 * 60 * 1000)
+    closed, price = await feed.poll()
+    # 10 реальных секунд × 30 = 300 виртуальных секунд = максимум 5 свечей по 1 минуте
+    expected_max = int(MAX_REAL_STEP_SEC * 30 // 60) + 2
+    assert len(closed) <= expected_max, f"сгенерировано {len(closed)} свечей за один опрос"
+    assert abs(price / price_before - 1) < 0.05, "цена не должна прыгать на десятки процентов"
+    # виртуальные часы идут синхронно с реальными (с учётом ускорения)
+    assert abs((feed.vnow - feed.current.ts) / 1000) <= feed.tf_ms / 1000
+
+    # обычный опрос в реальном времени по-прежнему даёт движение цены
+    feed._last_tick -= 1000
+    closed2, price2 = await feed.poll()
+    assert price2 != price_before
