@@ -8,10 +8,15 @@ const path = require('path');
 const { JSDOM } = require('jsdom');
 
 const WEB = process.argv[2] || '/home/user/planb/web';
+const PAGE_URL = process.argv[3] || 'http://localhost:8000/';
+const EXPECTED_BASE = (new URL(PAGE_URL).pathname.replace(/[^/]*$/, '') || '/');
 const html = fs.readFileSync(path.join(WEB, 'index.html'), 'utf8');
 const js = fs.readFileSync(path.join(WEB, 'app.js'), 'utf8');
 
-const dom = new JSDOM(html, { runScripts: 'outside-only', pretendToBeVisual: true });
+const dom = new JSDOM(html, {
+  url: PAGE_URL,                          // как в браузере: относительные пути работают
+  runScripts: 'outside-only', pretendToBeVisual: true,
+});
 const { window } = dom;
 const errors = [];
 window.addEventListener('error', (e) => errors.push('window.error: ' + e.message));
@@ -96,7 +101,10 @@ window.fetch = (url, opts) => {
   else if (url.includes('/api/candles')) body = candles;
   return Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve(JSON.stringify(body)) });
 };
-class FakeWS { constructor() { this.readyState = 1; } close() {} send() {} }
+class FakeWS {
+  constructor(url) { this.url = url; this.readyState = 1; window.__wsUrl = url; }
+  close() {} send() {}
+}
 window.WebSocket = FakeWS;
 window.confirm = () => true;
 window.alert = () => {};
@@ -116,6 +124,8 @@ setTimeout(async () => {
   const text = (id) => ($(id) ? $(id).textContent.trim() : '(нет элемента)');
 
   check('запрошены настройки и состояние', calls.some((c) => c.includes('/api/settings')) && calls.some((c) => c.includes('/api/state')));
+  check(`все запросы идут с префиксом ${EXPECTED_BASE}`,
+    calls.length > 0 && calls.every((c) => c.startsWith(EXPECTED_BASE)), calls.slice(0, 3).join(', '));
   check('форма настроек построена', window.document.querySelectorAll('#settingsForm .field').length > 20,
     window.document.querySelectorAll('#settingsForm .field').length + ' полей');
   check('форма бэктеста построена', window.document.querySelectorAll('#btForm .field').length > 10);
@@ -151,6 +161,8 @@ setTimeout(async () => {
   check('вкладка позиций показывает 3 позиции',
     window.document.querySelectorAll('#openPositionsTable tbody tr').length === 3);
 
+  check('WebSocket подключён по правильному пути',
+    window.__wsUrl && window.__wsUrl.endsWith(EXPECTED_BASE + 'ws'), window.__wsUrl);
   check('нет необработанных ошибок', errors.length === 0, errors.join(' | '));
   console.log(process.exitCode ? '\nПРОВЕРКА ПРОВАЛЕНА' : '\nПанель работает: все проверки пройдены');
   process.exit(process.exitCode || 0);

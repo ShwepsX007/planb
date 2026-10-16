@@ -11,6 +11,10 @@ const cls = (v) => v > 0 ? 'pos' : v < 0 ? 'neg' : 'neutral';
 const ts = (ms) => ms ? new Date(ms).toLocaleString('ru-RU', { hour12: false }) : '—';
 const timeOnly = (ms) => ms ? new Date(ms).toLocaleTimeString('ru-RU', { hour12: false }) : '—';
 
+/* Префикс пути: панель работает и напрямую (http://host:8015/), и за
+   nginx-префиксом (https://host/planb/) — все запросы относительные. */
+const BASE = location.pathname.replace(/[^/]*$/, '') || '/';
+
 const app = {
   snapshot: null, settings: null, logs: [], ws: null, wsTimer: null,
   chart: null, series: null, priceLines: [], lastChartUpdate: 0, chartTabActive: false,
@@ -20,7 +24,7 @@ const app = {
 
 /* ------------------------------------------------------------------ helpers */
 async function api(method, path, body) {
-  const res = await fetch(path, {
+  const res = await fetch(BASE + path.replace(/^\//, ''), {
     method,
     headers: body ? { 'Content-Type': 'application/json' } : {},
     body: body ? JSON.stringify(body) : undefined,
@@ -46,7 +50,7 @@ function toast(message, kind = 'ok') {
 /* ---------------------------------------------------------------------- ws */
 function connectWS() {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  const ws = new WebSocket(`${proto}://${location.host}/ws`);
+  const ws = new WebSocket(`${proto}://${location.host}${BASE}ws`);
   app.ws = ws;
   ws.onmessage = (ev) => {
     let msg = null;
@@ -675,6 +679,11 @@ async function init() {
   $('btnRefreshCycles').onclick = loadHistory;
   $('btnExportCycles').onclick = exportCyclesCsv;
   $('btnRunBacktest').onclick = runBacktest;
+  $('btnResetCycle').onclick = () => {
+    if (confirm('Закрыть незакрытый цикл только в учёте бота? Позиции на бирже не затрагиваются.\n' +
+                'Используйте, если позиция уже закрыта вручную или отсутствует.'))
+      botAction('/api/bot/reset-cycle', 'Сброс цикла');
+  };
   $('btnFit').onclick = () => app.chart && app.chart.timeScale().fitContent();
   $('chkFib').onchange = () => updateChart(true);
   $('chkMarks').onchange = () => updateChart(true);

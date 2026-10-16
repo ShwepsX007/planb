@@ -47,6 +47,15 @@ def _db_path() -> str:
     return os.environ.get("PLANB_DB", str(ROOT / "data" / "planb.sqlite3"))
 
 
+def autostart_enabled() -> bool:
+    """Автозапуск бота при старте процесса (для systemd/Docker).
+
+    По умолчанию включён: если сервер перезагрузился, открытая позиция не должна
+    остаться без управления. Отключается ``PLANB_AUTOSTART=0``.
+    """
+    return os.environ.get("PLANB_AUTOSTART", "1").strip().lower() not in ("0", "false", "no", "off", "")
+
+
 def create_app(db_path: Optional[str] = None) -> FastAPI:
     db = Database(db_path or _db_path())
 
@@ -82,7 +91,9 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
     @app.middleware("http")
     async def auth_middleware(request: Request, call_next):
         path = request.url.path
-        if auth_pass and (path.startswith("/api") or path == "/"):
+        # /api/health остаётся открытым для мониторинга и healthcheck Docker
+        protected = path == "/" or (path.startswith("/api") and path != "/api/health")
+        if auth_pass and protected:
             if not _check_auth(request.headers.get("authorization")):
                 return Response(status_code=401, headers={"WWW-Authenticate": 'Basic realm="PlanB"'},
                                 content="Требуется авторизация")
@@ -162,6 +173,10 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
     @app.post("/api/bot/reset-stats")
     async def bot_reset():
         return await runtime.reset_stats()
+
+    @app.post("/api/bot/reset-cycle")
+    async def bot_reset_cycle():
+        return await runtime.reset_cycle()
 
     # ---------------------------------------------------------------- market
     @app.get("/api/candles")
@@ -259,6 +274,21 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
             pass
         finally:
             runtime.unsubscribe(queue)
+
+    @app.on_event("startup")
+    async def _startup():
+        """Автозапуск бота при старте процесса (systemd/Docker)."""
+        if not autostart_enabled():
+            runtime.log("info", "автозапуск отключён (PLANB_AUTOSTART=0)", persist=False)
+            return
+        if runtime.should_autostart():
+            result = await runtime.start(runtime.settings)
+            if not result.get("ok"):
+                runtime.log("error", f"автозапуск не удался: {result.get('error')}", persist=False)
+        elif runtime.engine.cycle is not None:
+            runtime.log("warn", "после запуска обнаружен незакрытый цикл, но бот был остановлен "
+                                "пользователем — нажмите «Продолжить», чтобы взять его в работу",
+                        persist=False)
 
     @app.on_event("shutdown")
     async def _shutdown():

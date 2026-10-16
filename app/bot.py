@@ -55,6 +55,25 @@ class BotRuntime:
         self._load_state()
 
     # ------------------------------------------------------------------ state
+    @property
+    def desired_running(self) -> bool:
+        """Пользователь нажимал «Старт» и не нажимал «Стоп»."""
+        return bool(self.db.kv_get("desired_running", False))
+
+    def _set_desired_running(self, value: bool) -> None:
+        self.db.kv_set("desired_running", bool(value))
+
+    def should_autostart(self) -> bool:
+        """Нужно ли поднимать бота при запуске процесса (после перезагрузки сервера).
+
+        Запускаем, если пользователь ранее нажал «Старт» и не останавливал бота,
+        либо если в базе есть незакрытый цикл — так открытая позиция не остаётся
+        без управления.
+        """
+        if self.db.kv_get("desired_running") is None:
+            return self.engine.cycle is not None      # первый запуск: ждём кнопку «Старт»
+        return self.desired_running
+
     def _load_state(self) -> None:
         state = self.db.load_runtime_state()
         self.engine.restore(state.get("cycle_raw"))
@@ -144,6 +163,7 @@ class BotRuntime:
                     self.engine.stop_reason = ""
                 self.paused = False
                 self.status = STATUS_RUNNING
+                self._set_desired_running(True)
                 self.started_at = now_ms()
                 self._stop_evt = asyncio.Event()
                 self._task = asyncio.create_task(self._run_loop())
@@ -195,6 +215,7 @@ class BotRuntime:
         async with self._lock:
             self._persist_state()
             await self._teardown()
+            self._set_desired_running(False)
             self.status = STATUS_STOPPED
             self.log("info", f"Бот остановлен: {reason}")
             return {"ok": True, "status": self.status}
@@ -233,6 +254,28 @@ class BotRuntime:
             self.log("error", f"не удалось закрыть позиции: {exc}")
             return {"ok": False, "error": str(exc)}
 
+    async def reset_cycle(self, reason: str = "цикл сброшен вручную") -> Dict[str, Any]:
+        """Закрыть незакрытый цикл только в учёте (позиции на бирже уже нет).
+
+        Нужно, если позицию закрыли руками на бирже: записываем цикл как завершённый
+        по текущей цене, чтобы бот мог продолжить работу.
+        """
+        cycle = self.engine.cycle
+        if cycle is None:
+            return {"ok": False, "error": "нет незакрытого цикла"}
+        price = self.engine.last_price or cycle.avg_entry
+        closed = self.engine.close_cycle(price, now_ms(), reason)
+        self._persist_state()
+        self.db.save_cycle(closed)
+        for pos in closed.positions:
+            self.db.save_position(closed, pos)
+        self.paused = False
+        if self.status == STATUS_PAUSED:
+            self.status = STATUS_RUNNING
+        self.log("warn", f"Цикл {closed.id} сброшен в учёте по цене {price:g}: "
+                         f"{closed.pnl:+.4f}$ (оценка, комиссии не пересчитаны)")
+        return {"ok": True, "price": price, "pnl": closed.pnl}
+
     async def reset_stats(self) -> Dict[str, Any]:
         self.engine.realized_pnl = 0.0
         self.engine.cycles_total = 0
@@ -248,13 +291,29 @@ class BotRuntime:
     async def apply_settings(self, new_settings: BotSettings) -> Dict[str, Any]:
         """Save settings; if the bot runs - restart so they take effect."""
         was_running = self.status in (STATUS_RUNNING, STATUS_PAUSED)
+        old = self.settings
+        market_changed = (
+            new_settings.data_source != old.data_source
+            or new_settings.symbol != old.symbol
+            or new_settings.market_type != old.market_type
+            or new_settings.timeframe != old.timeframe
+            or new_settings.trade_mode != old.trade_mode
+        )
         self.settings = new_settings
         self.db.save_settings(new_settings)
         self.engine.settings = new_settings
         self.log("info", "Настройки сохранены")
         if was_running:
             await self.start(new_settings)
-        return {"ok": True, "restarted": was_running}
+            if market_changed and self.engine.cycle is not None:
+                # рынок изменился, а цикл открыт: не торгуем автоматически на новом
+                # рынке, пока пользователь не проверит позиции
+                self.paused = True
+                self.status = STATUS_PAUSED
+                self.log("warn", "изменён рынок/символ/таймфрейм/режим торговли, но остался "
+                                 "незакрытый цикл — бот на паузе. Проверьте позиции и нажмите "
+                                 "«Продолжить» либо «Закрыть всё»/«Сбросить цикл».")
+        return {"ok": True, "restarted": was_running, "paused_after_restart": self.paused}
 
     # ------------------------------------------------------------------- loop
     async def _run_loop(self) -> None:
@@ -353,9 +412,9 @@ class BotRuntime:
         if expected and total and abs(total - expected) / expected > 0.05:
             self.log("warn", f"размер позиции на бирже ({total:g}) не совпадает с расчётным ({expected:g})")
         elif expected and not total:
-            self.log("error", "в базе есть незакрытый цикл, а на бирже позиции нет — "
-                              "бот поставлен на паузу: закройте цикл кнопкой «Закрыть всё», "
-                              "сбросьте состояние или запустите заново")
+            self.log("error", "в базе есть незакрытый цикл, а на бирже позиции нет — бот поставлен "
+                              "на паузу: проверьте, не закрыта ли позиция вручную, и нажмите "
+                              "«Сбросить цикл» на вкладке «Циклы и сделки»")
             self.paused = True
             if self.status == STATUS_RUNNING:
                 self.status = STATUS_PAUSED

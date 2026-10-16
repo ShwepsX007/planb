@@ -4,8 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>PlanB — бот на коррекции Фибоначчи (Gate.io)</title>
-<link rel="stylesheet" href="/static/styles.css">
-<script src="/static/vendor/lightweight-charts.standalone.production.js"></script>
+<link rel="stylesheet" href="static/styles.css">
+<script src="static/vendor/lightweight-charts.standalone.production.js"></script>
 </head>
 <body>
 <header class="topbar">
@@ -168,7 +168,9 @@
     <div class="box">
       <div class="box-head"><h2>Завершённые циклы</h2>
         <div class="row"><button class="btn btn-small" id="btnRefreshCycles">Обновить</button>
-        <button class="btn btn-small" id="btnExportCycles">CSV</button></div>
+        <button class="btn btn-small" id="btnExportCycles">CSV</button>
+        <button class="btn btn-small" id="btnResetCycle"
+          title="Закрыть незакрытый цикл в учёте, если позиция уже закрыта на бирже вручную">Сбросить цикл</button></div>
       </div>
       <table class="tbl" id="cyclesTable">
         <thead><tr><th>Цикл</th><th>Сторона</th><th>Позиций</th><th>Средняя</th><th>Цель</th>
@@ -251,6 +253,6 @@
 </main>
 
 <div id="toast" class="toast hidden"></div>
-<script src="/static/app.js"></script>
+<script src="static/app.js"></script>
 </body>
 </html>
