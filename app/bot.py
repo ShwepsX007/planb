@@ -58,6 +58,8 @@ class BotRuntime:
         self._last_status_log = 0.0
         #: результат сканера сигналов: сколько раз стратегия сработала бы на истории
         self.signal_scan: Dict[str, Any] = {}
+        #: в журнал про «входов нет» пишем один раз на каждые настройки, а не каждый цикл
+        self._silence_warned_for: str = ""
         #: фоновые задания бэктеста (загрузка истории — долгая операция)
         self.backtest_jobs: Dict[str, Dict[str, Any]] = {}
         self._backtest_tasks: Dict[str, asyncio.Task] = {}
@@ -148,11 +150,18 @@ class BotRuntime:
             pass
 
     # ------------------------------------------------------------- lifecycle
-    async def start(self, settings: Optional[BotSettings] = None) -> Dict[str, Any]:
+    async def start(self, settings: Optional[BotSettings] = None, *,
+                    restart: bool = False) -> Dict[str, Any]:
+        """Запустить бота.
+
+        ``restart=True`` — пересобрать подключение к бирже (скорость демо-рынка,
+        таймфрейм, ключи и т.п. нельзя поменять «на живую»): останавливаем текущий
+        цикл и стартуем заново с новыми настройками.
+        """
         async with self._lock:
             if settings is not None:
                 self.settings = settings
-            if self.status == STATUS_RUNNING:
+            if self.status == STATUS_RUNNING and not restart:
                 return {"ok": True, "status": self.status, "message": "бот уже запущен"}
             self.error = ""
             try:
@@ -332,12 +341,32 @@ class BotRuntime:
             or new_settings.timeframe != old.timeframe
             or new_settings.trade_mode != old.trade_mode
         )
+        # Для этих настроек мало поменять поле: нужен новый фид/брокер. Раньше такие
+        # изменения (например скорость демо-рынка) молча не применялись, потому что
+        # start() выходил с «бот уже запущен» — теперь перезапускаем явно.
+        connection_changed = (
+            market_changed
+            or new_settings.demo_speed != old.demo_speed
+            or new_settings.poll_interval_sec != old.poll_interval_sec
+            or new_settings.api_key != old.api_key
+            or new_settings.api_secret != old.api_secret
+            or new_settings.sandbox != old.sandbox
+            or new_settings.leverage != old.leverage
+            or new_settings.margin_mode != old.margin_mode
+        )
         self.settings = new_settings
         self.db.save_settings(new_settings)
         self.engine.settings = new_settings
-        self.log("info", "Настройки сохранены")
-        if was_running:
-            await self.start(new_settings)
+        self.log("info", "Настройки сохранены"
+                         + (" — бот перезапущен, чтобы они вступили в силу"
+                            if was_running and connection_changed else ""))
+        if was_running and not connection_changed:
+            # пороги, объём и цели движок читает на каждом тике: перезапуск не нужен
+            self.log("info", f"Новые пороги применены без перезапуска: мин. движение "
+                             f"{new_settings.min_move_pct:g}%, мин. профит "
+                             f"{new_settings.min_profit_pct:g}%, свечей {new_settings.candles_count}")
+        if was_running and connection_changed:
+            await self.start(new_settings, restart=True)
             if market_changed and self.engine.cycle is not None:
                 # рынок изменился, а цикл открыт: не торгуем автоматически на новом
                 # рынке, пока пользователь не проверит позиции
@@ -346,7 +375,8 @@ class BotRuntime:
                 self.log("warn", "изменён рынок/символ/таймфрейм/режим торговли, но остался "
                                  "незакрытый цикл — бот на паузе. Проверьте позиции и нажмите "
                                  "«Продолжить» либо «Закрыть всё»/«Сбросить цикл».")
-        return {"ok": True, "restarted": was_running, "paused_after_restart": self.paused}
+        return {"ok": True, "restarted": bool(was_running and connection_changed),
+                "connection_changed": connection_changed, "paused_after_restart": self.paused}
 
     # ------------------------------------------------------------------- loop
     async def _run_loop(self) -> None:
@@ -431,8 +461,35 @@ class BotRuntime:
             scan = scan_signals(candles, self.settings)
             scan["updated_at"] = now_ms()
             self.signal_scan = scan
+            self._warn_about_silence(scan)
         except Exception as exc:      # диагностика не должна ломать торговлю
             self.signal_scan = {"error": str(exc)}
+
+    def _warn_about_silence(self, scan: Dict[str, Any]) -> None:
+        """Один раз на настройки объяснить в журнале, почему входов нет.
+
+        Иначе «бот молчит» остаётся без ответа: пользователь видит только тишину.
+        Пишем конкретные цифры и что именно уменьшить.
+        """
+        if not scan.get("enough_data") or scan.get("error"):
+            return
+        key = (f"{self.settings.data_source}|{self.settings.timeframe}|{self.settings.candles_count}|"
+               f"{self.settings.min_move_pct}|{self.settings.min_profit_pct}|{self.settings.direction}")
+        if scan.get("signals"):
+            self._silence_warned_for = ""      # сигналы снова есть — предупредим при новой тишине
+            return
+        if scan.get("windows", 0) < 30 or key == self._silence_warned_for:
+            return
+        self._silence_warned_for = key
+        hours = max(1, round(scan.get("minutes", 0) / 60))
+        self.log("warn",
+                 f"Входов не было: за {scan['windows']} окон истории (≈{hours} ч, "
+                 f"{scan['candles']} свечей {scan['timeframe']}) движения в окне настроек были "
+                 f"от {scan['move_median_pct']}% (медиана) до {scan['move_max_pct']}% (максимум), "
+                 f"а порог «Минимальное движение цены» — {scan['threshold_pct']}%. "
+                 f"Похоже, порог выше рынка: попробуйте {scan['suggested_threshold_pct']}% "
+                 f"и «Минимальный профит» не больше {round(scan['suggested_threshold_pct'] / 2, 2)}% "
+                 f"(сейчас {scan['min_profit_pct']}%), либо таймфрейм крупнее.")
 
     async def scan_signals_now(self, limit: int = 1000) -> Dict[str, Any]:
         """Сканер по кнопке: тянем свежую историю и считаем сигналы."""

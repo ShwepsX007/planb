@@ -50,7 +50,7 @@ const snapshot = {
   signal_scan: { candles: 300, windows: 298, signals: 0, enough_data: true,
                  move_median_pct: 0.12, move_p90_pct: 0.41, move_max_pct: 0.52,
                  threshold_pct: 0.6, candles_count: 3, timeframe: '5m',
-                 symbol: 'BTC/USDT', minutes: 1490, direction: 'both',
+                 symbol: 'BTC/USDT', minutes: 1490, direction: 'both', updated_at: Date.now(),
                  last_reason: 'движение 0.31% < порога 0.6%', near: [], signal_list: [] },
   symbol: 'BTC/USDT', timeframe: '5m', market_type: 'futures', error: '',
   started_at: Date.now() - 60000, last_loop_ts: Date.now(), loop_count: 42,
@@ -318,6 +318,25 @@ setTimeout(async () => {
   check('кнопка запрашивает глубокий сканер', scanCalls > 0 && calls.some((c) => c.includes('signals/scan?refresh=1')),
     calls.filter((c) => c.includes('signals')).join(', '));
   check('после сканера панель перерисовалась', $('stateHint').textContent.length >= 0);
+
+  // связь с биржей пропала: честнее сказать «нет данных», чем «входов нет»
+  const offline = JSON.parse(JSON.stringify(silent));
+  offline.feed.last_ok_ts = Date.now() - 10 * 60 * 1000;
+  window.__wsInstance.onmessage({ data: JSON.stringify({ type: 'snapshot', snapshot: offline }) });
+  await new Promise((r) => setTimeout(r, 50));
+  check('обрыв связи важнее подсказки о входах',
+    $('stateHint').textContent.includes('перестали приходить')
+      && !$('stateHint').textContent.includes('Свечи идут, но входов нет'),
+    $('stateHint').textContent.slice(0, 120));
+
+  // старый скан (больше получаса назад) ничего не объясняет — числа могли устареть
+  const oldScan = JSON.parse(JSON.stringify(silent));
+  oldScan.signal_scan.updated_at = Date.now() - 45 * 60 * 1000;
+  window.__wsInstance.onmessage({ data: JSON.stringify({ type: 'snapshot', snapshot: oldScan }) });
+  await new Promise((r) => setTimeout(r, 50));
+  check('устаревший сканер не выдаётся за свежий диагноз',
+    !$('stateHint').textContent.includes('Свечи идут, но входов нет'),
+    $('stateHint').textContent.slice(0, 120));
 
   check('нет необработанных ошибок', errors.length === 0, errors.join(' | '));
   console.log(process.exitCode ? '\nПРОВЕРКА ПРОВАЛЕНА' : '\nПанель работает: все проверки пройдены');

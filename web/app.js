@@ -184,7 +184,13 @@ function renderStateHint(s, e, c) {
   } else if (s.status === 'running' && !s.price) {
     kind = '';
     html = 'Бот запущен и получает первые свечи — данные появятся в течение минуты.';
-  } else if (s.status === 'running' && s.data_real !== false && !c && scanEmpty(s)) {
+  } else if (s.status === 'running' && s.feed && s.feed.last_ok_ts
+             && Date.now() - s.feed.last_ok_ts > 180000) {
+    kind = 'err';
+    html = '<b>Данные с биржи перестали приходить</b> (последний ответ больше 3 минут назад). ' +
+      'Проверьте связь с биржей: <code>curl -s -m 10 https://api.gateio.ws/api/v4/spot/time</code>';
+  } else if (s.status === 'running' && s.data_real !== false && !c && scanEmpty(s)
+             && scanFresh(s)) {
     // бот действительно молчит: свечи идут, но входов нет — объясняем цифрами
     const scan = s.signal_scan || {};
     const hours = scan.minutes ? Math.max(1, Math.round(scan.minutes / 60)) : 0;
@@ -196,11 +202,6 @@ function renderStateHint(s, e, c) {
       `Уменьшите «Минимальное движение цены» на вкладке «Настройки» (например до ` +
       `${suggestThreshold(scan)}) или возьмите таймфрейм крупнее — тогда входов станет больше. ` +
       `<button class="btn btn-small" id="btnScanSignals">Проверить сигналы заново</button>`;
-  } else if (s.status === 'running' && s.feed && s.feed.last_ok_ts
-             && Date.now() - s.feed.last_ok_ts > 180000) {
-    kind = 'err';
-    html = '<b>Данные с биржи перестали приходить</b> (последний ответ больше 3 минут назад). ' +
-      'Проверьте связь с биржей: <code>curl -s -m 10 https://api.gateio.ws/api/v4/spot/time</code>';
   } else if (s.status === 'target_reached') {
     kind = 'ok';
     html = `<b>Цель по общему профиту достигнута</b> (${fmt(e.realized_pnl, 4)} $). ` +
@@ -222,12 +223,20 @@ function renderStateHint(s, e, c) {
   if (scanButton) scanButton.onclick = scanSignalsNow;
 }
 
+function scanFresh(s) {
+  // скан старше 30 минут ничего не объясняет: числа могли устареть
+  const scan = s.signal_scan || {};
+  return !scan.updated_at || (Date.now() - scan.updated_at < 30 * 60 * 1000);
+}
+
 function scanEmpty(s) {
   const scan = s.signal_scan;
   return !!(scan && scan.enough_data && !scan.error && !scan.signals);
 }
 
 function suggestThreshold(scan) {
+  // сервер считает то же самое — берём его значение, чтобы панель и журнал не расходились
+  if (scan.suggested_threshold_pct) return fmt(scan.suggested_threshold_pct, 2) + ' %';
   const base = scan.move_median_pct || 0;
   const value = Math.max(0.05, Math.min((scan.threshold_pct || 0.6) * 0.6,
                                         (scan.move_max_pct || 0.2) * 0.8,

@@ -42,7 +42,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence
 
 from .config import BotSettings
-from .fib import detect_impulse, fib_level
+from .fib import _is_down, _is_up, detect_impulse, fib_level
 from .models import Action, Candle, Cycle, Fill, Position, Side, now_ms
 
 
@@ -461,6 +461,12 @@ def scan_signals(candles: Sequence[Candle], settings, *, sample: int = 5) -> Dic
 
     near.sort(key=lambda item: -item["move_pct"])
     tf_min = max(1, int(settings.tf_seconds() / 60)) * max(0, total - n)
+    median = quantile(0.5)
+    max_move = max(moves) if moves else 0.0
+    #: что предложить вместо текущего порога: чуть ниже порога, но не выше
+    #: того, что рынок реально давал в этом окне (иначе снова тишина)
+    suggested = max(0.05, min(settings.min_move_pct * 0.6, max_move * 0.8,
+                              max(median * 2.0, 0.1)))
     return {
         "candles": total,
         "windows": len(moves),
@@ -470,9 +476,11 @@ def scan_signals(candles: Sequence[Candle], settings, *, sample: int = 5) -> Dic
         "enough_data": True,
         "last_reason": last_reason,
         "threshold_pct": settings.min_move_pct,
-        "move_median_pct": round(quantile(0.5), 3),
+        "min_profit_pct": settings.min_profit_pct,
+        "suggested_threshold_pct": round(suggested, 2),
+        "move_median_pct": round(median, 3),
         "move_p90_pct": round(quantile(0.9), 3),
-        "move_max_pct": round(max(moves) if moves else 0.0, 3),
+        "move_max_pct": round(max_move, 3),
         "candles_count": n,
         "timeframe": settings.timeframe,
         "symbol": settings.symbol,

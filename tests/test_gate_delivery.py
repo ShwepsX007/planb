@@ -218,6 +218,66 @@ async def test_runtime_reacts_to_candles_from_the_exchange(tmp_path, monkeypatch
 
 
 # ---------------------------------------------------------------- сканер сигналов
+def test_scan_explains_near_misses_without_crashing():
+    """«Почти-входы» — объяснение тишины, и они не должны ронять сканер.
+
+    Регрессия: при порогах, когда до входа не хватает профита (а не движения),
+    ветка «почти-вошли» вызывала внутренний NameError — и панель вместо подсказки
+    «чего не хватает» показывала ошибку. Ровно в этой ситуации оказывается
+    пользователь с высокими порогами на реальных данных.
+    """
+    settings = BotSettings(timeframe="1m", candles_count=3, min_move_pct=0.5,
+                           fib_goal_pct=50.0, min_profit_pct=0.5, direction="both")
+    for direction in ("down", "up"):
+        candles = impulse_candles(120, move_pct=0.2, end_ts=(now_ms() // MIN - 1) * MIN,
+                                  direction=direction)
+        scan = scan_signals(candles, settings)
+        assert "error" not in scan, scan
+        assert scan["windows"] > 100
+        assert scan["signals"] == 0, "вход не должен проходить по порогу профита"
+        assert scan["near"], "движение проходит, профита не хватает — это «почти-вход»"
+        assert all(item["side"] in ("up", "down") for item in scan["near"])
+        assert scan["near"][0]["move_pct"] >= settings.min_move_pct * 0.8
+
+
+def test_scan_suggests_threshold_from_real_movements():
+    """Сканер сам предлагает порог: не выше того, что рынок реально давал."""
+    settings = BotSettings(timeframe="1m", candles_count=3, min_move_pct=3.0,
+                           fib_goal_pct=50.0, min_profit_pct=0.15, direction="both")
+    candles = impulse_candles(200, move_pct=0.4, end_ts=(now_ms() // MIN - 1) * MIN)
+    scan = scan_signals(candles, settings)
+    assert "error" not in scan
+    assert scan["signals"] == 0 and scan["windows"] > 150
+    suggested = scan["suggested_threshold_pct"]
+    assert 0.05 <= suggested < settings.min_move_pct, suggested
+    assert suggested <= round(scan["move_max_pct"], 3), (suggested, scan["move_max_pct"])
+    assert scan["min_profit_pct"] == 0.15
+
+
+def test_journal_explains_silence_once_per_settings():
+    """Тишина должна быть объяснена в журнале — один раз, с цифрами и советом."""
+    runtime = BotRuntime(Database(":memory:"),
+                         BotSettings(timeframe="1m", candles_count=3, min_move_pct=3.0,
+                                     fib_goal_pct=50.0, min_profit_pct=0.15))
+    runtime._chart_candles = impulse_candles(200, move_pct=0.4, end_ts=(now_ms() // MIN - 1) * MIN)
+    runtime._refresh_signal_scan()
+    warnings = [e for e in runtime.logs if e["level"] == "warn" and "Входов не было" in e["message"]]
+    assert len(warnings) == 1, [e["message"] for e in warnings]
+    text = warnings[0]["message"]
+    assert "порог «Минимальное движение цены» — 3.0%" in text
+    assert "попробуйте" in text and "%" in text
+
+    # второй скан при тех же настройках молчит: журнал не засоряем
+    runtime._refresh_signal_scan()
+    assert len([e for e in runtime.logs if "Входов не было" in e["message"]]) == 1
+
+    # настройки поменяли — про тишину сообщаем снова
+    runtime.settings.min_move_pct = 2.0
+    runtime.settings.min_profit_pct = 0.1
+    runtime._refresh_signal_scan()
+    assert len([e for e in runtime.logs if "Входов не было" in e["message"]]) == 2
+
+
 def test_scan_signals_counts_and_explains():
     """Сканер должен отвечать цифрами: сколько сигналов и какие были движения."""
     settings = BotSettings(timeframe="1m", candles_count=3, min_move_pct=0.6,

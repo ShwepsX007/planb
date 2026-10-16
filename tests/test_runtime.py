@@ -229,3 +229,46 @@ async def test_settings_change_without_cycle_does_not_pause(tmp_path):
     assert result["paused_after_restart"] is False
     assert runtime.paused is False
     await runtime.stop()
+
+
+# ------------------------------------- настройки, которым нужен новый фид
+@pytest.mark.asyncio
+async def test_connection_settings_restart_the_bot_for_real(tmp_path):
+    """Скорость демо-рынка и таймфрейм нельзя поменять «на живую» — нужен новый фид.
+
+    Раньше apply_settings звал start(), а тот выходил с «бот уже запущен»: настройка
+    сохранялась, но не действовала — и пользователь видел старое поведение.
+    """
+    runtime = make_runtime(tmp_path)
+    await runtime.start(runtime.settings)
+    old_feed = runtime.feed
+
+    new_settings = BotSettings(**{**runtime.settings.model_dump(), "demo_speed": 60.0})
+    result = await runtime.apply_settings(new_settings)
+
+    assert result["connection_changed"] is True and result["restarted"] is True
+    assert runtime.settings.demo_speed == 60.0
+    assert runtime.feed is not old_feed, "фид должен быть пересоздан со новой скоростью"
+    assert runtime.feed.speed == 60.0
+    assert any("перезапущен" in e["message"] for e in runtime.logs)
+    await runtime.stop()
+
+
+@pytest.mark.asyncio
+async def test_threshold_settings_apply_without_restart(tmp_path):
+    """Пороги движок читает на каждом тике — перезапускать бота для них не нужно."""
+    runtime = make_runtime(tmp_path)
+    await runtime.start(runtime.settings)
+    feed_before = runtime.feed
+
+    new_settings = BotSettings(**{**runtime.settings.model_dump(),
+                                  "min_move_pct": 0.25, "min_profit_pct": 0.1,
+                                  "candles_count": 4})
+    result = await runtime.apply_settings(new_settings)
+
+    assert result["connection_changed"] is False and result["restarted"] is False
+    assert runtime.status == STATUS_RUNNING and runtime.feed is feed_before
+    assert runtime.engine.settings.min_move_pct == 0.25
+    assert runtime.engine.settings.candles_count == 4
+    assert any("без перезапуска" in e["message"] for e in runtime.logs)
+    await runtime.stop()
