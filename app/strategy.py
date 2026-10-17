@@ -183,10 +183,12 @@ class StrategyEngine:
             if profit_pct <= s.min_profit_pct + 1e-9 and guard_ok:
                 idx = len(cycle.positions) + 1
                 volume = s.volume_for_position(idx)
-                # Долив имеет смысл, только если ПОСЛЕ усреднения профит до цели
-                # будет не меньше минимума. Иначе цикл становится безнадёжным:
-                # средняя подходит к цели вплотную, и «профита по цели» не будет
-                # никогда — именно так сделка «висит» (см. скриншот с целью 0.0002%).
+                # Усреднение делаем ВСЕГДА, когда сработали условия входа: каждая
+                # новая позиция сдвигает среднюю к цене и приближает выход в плюс.
+                # Раньше здесь стоял запрет «долив не поможет», и на мелких объёмах
+                # он блокировал вообще все доливы: цель едет вниз вместе с ценой,
+                # профит после усреднения остаётся около нуля, и цикл застревал
+                # с одной позицией (см. «бот как бы вошёл и ничего не делает»).
                 qty_now = cycle.total_qty
                 add_qty = volume / candle.close if candle.close > 0 else 0.0
                 new_avg = ((avg * qty_now + candle.close * add_qty) / (qty_now + add_qty)
@@ -194,13 +196,8 @@ class StrategyEngine:
                 profit_after = (new_avg and (
                     (cycle.target / new_avg - 1.0) * 100.0 if cycle.side == "long"
                     else (1.0 - cycle.target / new_avg) * 100.0))
-                if profit_after < s.min_profit_pct - 1e-9:
-                    self.last_check = (f"долив #{idx} не поможет: после усреднения профит до цели "
-                                       f"{profit_after:.2f}% < {s.min_profit_pct:g}% — "
-                                       f"ждём новый экстремум/откат")
-                    return []
-                self.last_check = (f"долив #{idx}: профит до цели {profit_pct:.2f}% "
-                                   f"<= {s.min_profit_pct:g}%, средняя {avg:g}")
+                self.last_check = (f"долив #{idx}: профит до цели {profit_pct:.3f}% "
+                                   f"<= {s.min_profit_pct:g}%, средняя {avg:g} → {new_avg:g}")
                 return [Action(
                     kind="add",
                     side=cycle.side,
@@ -208,12 +205,15 @@ class StrategyEngine:
                     volume_usd=volume,
                     position_idx=idx,
                     target=cycle.target,
-                    reason=(f"профит до цели {profit_pct:.2f}% <= минимума "
-                            f"{s.min_profit_pct:g}% (средняя {avg:g})"),
+                    reason=(f"профит до цели {profit_pct:.3f}% <= минимума "
+                            f"{s.min_profit_pct:g}% (средняя {avg:g}, после долива "
+                            f"{new_avg:g}, профит {profit_after:.3f}%)"),
                     ts=candle.ts,
                 )]
             if profit_pct <= s.min_profit_pct + 1e-9 and not guard_ok:
-                self.last_check = "ждём новый экстремум для долива"
+                self.last_check = (f"ждём новый экстремум для долива #{len(cycle.positions) + 1} "
+                                   f"(профит до цели {profit_pct:.2f}% уже <= "
+                                   f"{s.min_profit_pct:g}%)")
             else:
                 self.last_check = (f"в позиции, профит до цели {profit_pct:.2f}% "
                                    f"(мин. {s.min_profit_pct:g}%)")
@@ -284,15 +284,41 @@ class StrategyEngine:
         return []
 
     def _note_target_wait(self, cycle: Cycle, avg: float, target: float) -> None:
-        """Понятный статус, пока цена не дошла до цели."""
+        """Понятный статус, пока цена не дошла до цели.
+
+        Вызывается и между свечами (по тикам), поэтому здесь нельзя писать
+        «ждём долива», если долив на самом деле запрещён условиями: именно такая
+        надпись и выглядела как «бот ничего не делает».
+        """
+        s = self.settings
         profit_pct = cycle.profit_pct_to(target)
+        if len(cycle.positions) < s.max_positions:
+            nxt = len(cycle.positions) + 1
+            new_extreme = (cycle.swing_low < cycle.extreme_at_last_entry if cycle.side == "long"
+                           else cycle.swing_high > cycle.extreme_at_last_entry)
+            ready = profit_pct <= s.min_profit_pct + 1e-9
+            if ready and (not s.require_new_extreme_for_add or new_extreme):
+                self.last_check = (f"долив #{nxt} готов: профит до цели {profit_pct:.2f}% "
+                                   f"<= {s.min_profit_pct:g}%, экстремум обновлён — "
+                                   f"сработает на закрытии свечи")
+                return
+            if ready:
+                edge = "минимум" if cycle.side == "long" else "максимум"
+                self.last_check = (f"профит до цели {profit_pct:.2f}% <= "
+                                   f"{s.min_profit_pct:g}%, нужен новый {edge} для долива "
+                                   f"#{nxt} (сейчас {cycle.swing_low if cycle.side == 'long' else cycle.swing_high:g})")
+                return
+        elif cycle.positions:
+            self.last_check = (f"цель ещё не достигнута, профит до цели {profit_pct:.2f}% — "
+                               f"лимит позиций {s.max_positions} достигнут")
+            return
         if profit_pct < 0:
             where = "ниже" if cycle.side == "long" else "выше"
             self.last_check = (f"цель {target:g} {where} средней {avg:g}: профита по цели нет, "
-                               f"ждём долива/отката")
+                               f"ждём откат цены к средней")
             return
         self.last_check = (f"в позиции, профит до цели {profit_pct:.2f}% "
-                           f"(мин. {self.settings.min_profit_pct:g}%)")
+                           f"(мин. {s.min_profit_pct:g}%)")
 
     # ------------------------------------------------------------------- fills
     def apply_fill(self, action: Action, fill: Fill) -> Position:
@@ -471,7 +497,12 @@ class StrategyEngine:
             target=raw.get("target", 0.0),
             positions=positions,
             note=raw.get("note", ""),
-            extreme_at_last_entry=raw.get("extreme_at_last_entry", 0.0),
+            # старые сохранения не знали этого поля: без запасного значения (0)
+            # условие «новый экстремум для долива» не выполнилось бы никогда,
+            # и восстановленный цикл молча висел бы с одной позицией
+            extreme_at_last_entry=(raw.get("extreme_at_last_entry")
+                                   or (raw.get("swing_low") if raw.get("side", "long") == "long"
+                                       else raw.get("swing_high")) or 0.0),
             max_positions_used=raw.get("max_positions_used", len(positions) or 1),
         )
 

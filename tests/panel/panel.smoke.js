@@ -191,7 +191,7 @@ window.ResizeObserver = class { observe() {} };
 /* ---- запуск ---- */
 // app.js объявлен в strict-режиме, поэтому его функции не попадают в window.
 // Для проверки советов отдаём одну функцию наружу (сам app.js не меняем).
-window.eval(js + '\nwindow.scanAdvice = scanAdvice;');
+window.eval(js + '\nwindow.scanAdvice = scanAdvice; window.renderCostWarn = renderCostWarn;');
 window.document.dispatchEvent(new window.Event('DOMContentLoaded'));
 
 function check(name, cond, extra = '') {
@@ -325,6 +325,13 @@ setTimeout(async () => {
     !banner.classList.contains('hidden') && banner.textContent.includes('Свечи идут, но входов нет')
       && banner.textContent.includes('0,12') && banner.textContent.includes('0,60'),
     banner.textContent.slice(0, 120));
+  window.renderCostWarn({ fee_pct: 0.05, slippage_pct: 0.02, min_profit_pct: 0.01 });
+  check('панель предупреждает, что профит меньше комиссии',
+    !$('lgCostWarn').classList.contains('hidden') && $('lgCostWarn').textContent.includes('0,140'),
+    $('lgCostWarn').textContent.slice(0, 120));
+  window.renderCostWarn({ fee_pct: 0.05, slippage_pct: 0.02, min_profit_pct: 0.5 });
+  check('при нормальном профите предупреждения нет', $('lgCostWarn').classList.contains('hidden'));
+
   check('совет соответствует причине',
     window.scanAdvice({ last_reason: 'коррекция 62.0% уже дошла до цели — входить поздно' })
       .includes('прошла цель')

@@ -381,11 +381,32 @@ function renderLogic(s) {
   $('lgMinProfit').textContent = st.min_profit_pct ?? '—';
   $('lgMult').textContent = st.volume_multiplier ?? '—';
   $('lgTotal').textContent = st.total_profit_target_usd ?? '—';
+  renderCostWarn(st);
   const schedule = s.volume_schedule || st.volume_schedule || [];
   const html = schedule.map((v, i) => `<span class="chip">#${i + 1}: <b>${fmt(v, 2)} $</b></span>`).join('');
   $('scheduleBox').innerHTML = html;
   $('planTable').innerHTML = html;
   $('chartPair').textContent = `${s.symbol} · ${s.timeframe}`;
+}
+
+function renderCostWarn(st) {
+  // Минимальный профит меньше стоимости круга (комиссия + слиппедж туда-обратно)
+  // означает гарантированный минус в каждом закрытом цикле — об этом надо сказать.
+  const el = $('lgCostWarn');
+  if (!el) return;
+  const fee = Number(st.fee_pct || 0);
+  const slip = Number(st.slippage_pct || 0);
+  const minProfit = Number(st.min_profit_pct || 0);
+  const cost = 2 * (fee + slip);
+  if (minProfit > 0 && cost > 0 && minProfit < cost) {
+    el.classList.remove('hidden');
+    el.innerHTML = `<b>Минимальный профит ${fmt(minProfit, 3)} % меньше стоимости круга ` +
+      `≈ ${fmt(cost, 3)} %</b> (комиссия ${fmt(fee, 3)} % + слиппедж ${fmt(slip, 3)} % туда и обратно). ` +
+      `Даже цикл, закрытый по цели, уйдёт в минус — поставьте минимальный профит больше ` +
+      `${fmt(cost, 3)} %.`;
+  } else {
+    el.classList.add('hidden');
+  }
 }
 
 /* -------------------------------------------------------------------- logs */

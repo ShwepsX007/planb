@@ -307,27 +307,108 @@ def test_short_over_target_is_taken_too():
     assert acts[0].ref_price == pytest.approx(94.8)
 
 
-def test_add_that_makes_the_cycle_hopeless_is_skipped():
-    """Долив, после которого профит до цели < минимума, не делается.
+def test_add_happens_when_price_makes_a_new_low_even_if_it_barely_moves_the_average():
+    """Регрессия «бот вошёл и не доливает».
 
-    Именно так цикл становится «висящим»: средняя подходит к цели вплотную и
-    профита по цели не будет уже никогда.
+    Настройки как у пользователя: объём 1 $, минимальный профит 0.01 %, цель 45 %.
+    После входа цена обновила минимум на 90 пунктов, цель поехала за ней, и
+    старый запрет «долив не поможет» (профит после усреднения 0.004 % < 0.01 %)
+    блокировал ЛЮБОЙ долив — цикл застревал с одной позицией. Долив обязан
+    случиться: каждая позиция двигает среднюю к цене и приближает выход.
+    """
+    settings = swing_settings(
+        candles_count=2, min_move_pct=0.01, min_correction_pct=0.0, min_profit_pct=0.01,
+        fib_goal_pct=45.0, base_volume_usd=1.0, max_positions=10, update_swing_in_cycle=True)
+    engine = StrategyEngine(settings)
+    cycle = Cycle(id="stuck", side="long", signal_ts=0, signal_price=81628.62,
+                  opened_ts=0, swing_high=81645.7, swing_low=81602.8, goal_pct=45.0,
+                  target=81622.14, move_side="down",
+                  positions=[Position(idx=1, ts=0, price=81628.62, qty=1.0 / 81628.62,
+                                      volume_usd=1.0, fee=0.0)],
+                  extreme_at_last_entry=81602.8)
+    engine.cycle = cycle
+
+    acts = engine.on_candle(Candle(ts=TF, open=81600.0, high=81605.0, low=81539.0,
+                                   close=81539.0, volume=1.0))
+    adds = [a for a in acts if a.kind == "add"]
+    assert adds, f"долив не сделан: {engine.last_check}"
+    assert adds[0].position_idx == 2 and adds[0].volume_usd == pytest.approx(1.0)
+    # цель поехала за новым минимумом, но средняя после долива уже ближе к цели
+    assert engine.cycle.target < 81622.14
+    assert "средняя" in adds[0].reason and "профит" in adds[0].reason
+
+
+def test_add_is_not_postponed_until_the_average_is_perfect():
+    """Долив не откладывается «до идеального профита» — иначе бот молчит.
+
+    Проверяем на той же ситуации, что была у пользователя: после первого долива
+    профит до цели может быть ещё меньше минимума, и всё равно бот продолжает
+    усредняться на каждом новом минимуме, пока не дойдёт до лимита позиций.
+    """
+    settings = swing_settings(
+        candles_count=2, min_move_pct=0.01, min_correction_pct=0.0, min_profit_pct=0.01,
+        fib_goal_pct=45.0, base_volume_usd=1.0, max_positions=4, update_swing_in_cycle=True)
+    engine = StrategyEngine(settings)
+    engine.cycle = Cycle(
+        id="stuck", side="long", signal_ts=0, signal_price=81628.62, opened_ts=0,
+        swing_high=81645.7, swing_low=81602.8, goal_pct=45.0, target=81622.14,
+        move_side="down",
+        positions=[Position(idx=1, ts=0, price=81628.62, qty=1.0 / 81628.62,
+                            volume_usd=1.0, fee=0.0)],
+        extreme_at_last_entry=81602.8)
+
+    price, ts, adds = 81600.0, 0, 0
+    for _ in range(400):
+        price -= 1.0
+        ts += TF
+        acts = engine.on_candle(Candle(ts=ts, open=price + 1, high=price + 1.2,
+                                       low=price, close=price, volume=1.0))
+        for a in acts:
+            if a.kind == "add":
+                adds += 1
+                engine.apply_fill(a, Fill(price=price, qty=a.volume_usd / price, ts=ts))
+                break
+        if adds >= 3:
+            break
+    assert adds == 3, f"доливов {adds}, последняя проверка: {engine.last_check}"
+    assert len(engine.cycle.positions) == 4
+
+
+def test_restored_cycle_can_still_add_positions():
+    """После перезапуска бот не должен «забыть» экстремум и перестать доливать.
+
+    В старых сохранениях поля extreme_at_last_entry нет; с нулём условие
+    «новый экстремум» не срабатывало никогда — цикл висел с одной позицией.
     """
     settings = swing_settings(min_profit_pct=0.5)
     engine = StrategyEngine(settings)
-    cycle = Cycle(id="hopeless", side="long", signal_ts=0, signal_price=100.0,
-                 opened_ts=0, swing_high=100.0, swing_low=99.0, goal_pct=50.0,
-                 target=99.5, move_side="down",
-                 positions=[Position(idx=1, ts=0, price=100.0, qty=0.1,
-                                     volume_usd=10.0, fee=0.0)],
-                 extreme_at_last_entry=99.0)
-    engine.cycle = cycle
+    engine.restore({
+        "id": "restored", "side": "long", "signal_ts": 0, "signal_price": 100.0,
+        "opened_ts": 0, "swing_high": 100.0, "swing_low": 99.0, "goal_pct": 50.0,
+        "target": 99.5, "move_side": "down", "note": "",
+        "positions": [{"idx": 1, "ts": 0, "price": 99.9, "qty": 0.1,
+                       "volume_usd": 10.0, "fee": 0.0}],
+    })
+    assert engine.cycle.extreme_at_last_entry == pytest.approx(99.0)
 
-    acts = engine.on_candle(Candle(ts=TF, open=99.4, high=99.4, low=98.9, close=99.0,
+    acts = engine.on_candle(Candle(ts=TF, open=99.2, high=99.2, low=98.8, close=98.8,
                                    volume=1.0))
-    assert not [a for a in acts if a.kind == "add"], "долив не должен ухудшать цикл"
-    assert "не поможет" in engine.last_check
-    assert len(engine.cycle.positions) == 1
+    assert [a for a in acts if a.kind == "add"], engine.last_check
+
+
+def test_status_between_candles_does_not_promise_an_add_that_cannot_happen():
+    """Пока нового экстремума нет, панель должна писать именно это, а не «ждём долива»."""
+    settings = swing_settings(min_profit_pct=0.5)
+    engine = StrategyEngine(settings)
+    engine.cycle = make_cycle(avg=100.0, target=100.5)
+    engine.cycle.swing_low = 99.0
+    engine.cycle.extreme_at_last_entry = 99.0
+    engine.on_tick(99.6)                    # цена отошла от минимума
+    assert "нужен новый минимум" in engine.last_check
+
+    engine.cycle.swing_low = 98.9           # минимум обновлён, профит до цели < мин.
+    engine.on_tick(99.95)
+    assert "долив" in engine.last_check and "готов" in engine.last_check
 
 
 def test_add_is_allowed_when_it_restores_the_profit():
