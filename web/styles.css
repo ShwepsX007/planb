@@ -166,6 +166,9 @@ input:focus,select:focus{outline:none;border-color:#35507a}
 .bt-source h3{margin:0 0 6px;font-size:14px;color:#e6edf3}
 .bt-source p{margin:0 0 10px;font-size:12.5px}
 .bt-source code{background:#0b1017;padding:2px 5px;border-radius:4px;color:#ffd479;font-size:12px}
+.bt-archive{margin-top:14px;border-top:1px solid #1e293b;padding-top:10px}
+.bt-archive .box-head{display:flex;justify-content:space-between;align-items:baseline;gap:10px}
+.bt-archive h4{margin:0 0 6px;font-size:13px;color:#cbd5e1;text-transform:uppercase;letter-spacing:.04em}
 .bt-files{margin-top:10px;display:flex;flex-direction:column;gap:6px}
 .bt-file{display:flex;justify-content:space-between;align-items:center;gap:10px;
   background:#0b1017;border:1px solid #1b2532;border-radius:8px;padding:8px 10px;font-size:12.5px}

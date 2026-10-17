@@ -446,6 +446,19 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
             return {"ok": False, "error": "задание не выполняется"}
         return {"ok": True}
 
+    # --------------------------------------- глубокая история (архивы Gate.io)
+    @app.get("/api/history/archive")
+    async def history_archive_list():
+        """Что уже скачано из месячных архивов Gate.io (кеш для долгих тестов)."""
+        from .gate_archive import archive_dir, first_month, list_cache, max_candles
+        return {"ok": True, "items": list_cache(), "dir": str(archive_dir()),
+                "first_month": first_month(), "max_candles": max_candles()}
+
+    @app.delete("/api/history/archive/{key}")
+    async def history_archive_delete(key: str):
+        from .gate_archive import delete_cache
+        return {"ok": delete_cache(key)}
+
     # ------------------------------------------------- свечи: файлы и загрузка
     @app.get("/api/backtest/files")
     async def backtest_files():

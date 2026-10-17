@@ -28,8 +28,10 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
 from .config import TIMEFRAMES, BotSettings
 from .models import Candle, now_ms
 
-#: сколько свечей максимум имеет смысл тянуть (защита от случайного запроса на годы 1m-свечей)
-MAX_CANDLES = 200_000
+#: сколько свечей максимум имеет смысл держать в одном наборе.
+#: Архивы Gate.io позволяют тестировать годы истории: 2 года 5m — это ~210 000
+#: свечей, 2 года 1m — ~1 050 000, поэтому лимит поднят до 2 млн.
+MAX_CANDLES = 2_000_000
 #: максимальная страница истории Gate.io/ccxt
 PAGE_LIMIT = 1000
 #: сколько свечей просим у биржи в тестовом режиме

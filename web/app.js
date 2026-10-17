@@ -717,19 +717,27 @@ const BT_STRATEGY_FIELDS = [
 function renderBacktestForm(settings) {
   const st = settings || {};
   const defs = {
+    data_mode: 'archive',
     symbol: st.symbol || 'BTC/USDT',
     market_type: st.market_type || 'futures',
     timeframe: st.timeframe || '5m',
+    archive_period: '2',
     period_mode: 'limit',
     limit_candles: 3000,
     date_from: '',
     date_to: '',
   };
   const head = [
+    ['data_mode', 'Откуда данные', 'select',
+      [['archive', 'Архив Gate.io с 2023 г. — годы истории (рекомендую)'],
+       ['api', 'API Gate.io — последние ~10 000 свечей (быстро)']]],
     ['symbol', 'Пара', 'text'],
     ['market_type', 'Рынок', 'select', [['futures', 'Фьючерсы USDT-M'], ['spot', 'Спот']]],
     ['timeframe', 'Таймфрейм', 'tf'],
-    ['period_mode', 'Период', 'select', [['limit', 'Последние N свечей'], ['dates', 'С даты по дату (UTC)']]],
+    ['archive_period', 'Период архива', 'select',
+      [['1', 'последний год'], ['2', 'последние 2 года'], ['3', 'последние 3 года'],
+       ['all', 'весь архив (с 2023 г.)'], ['custom', 'свой период']]],
+    ['period_mode', 'Период API', 'select', [['limit', 'Последние N свечей'], ['dates', 'С даты по дату (UTC)']]],
     ['limit_candles', 'Сколько свечей', 'number'],
     ['date_from', 'С даты', 'text'],
     ['date_to', 'По дату', 'text'],
@@ -755,14 +763,64 @@ function renderBacktestForm(settings) {
   $('btForm').innerHTML = html(head) + html(BT_STRATEGY_FIELDS);
   const mode = $('bt_period_mode');
   if (mode) mode.onchange = syncBtPeriod;
-  syncBtPeriod();
+  const dataMode = $('bt_data_mode');
+  if (dataMode) dataMode.onchange = syncBtMode;
+  const archivePeriod = $('bt_archive_period');
+  if (archivePeriod) archivePeriod.onchange = syncBtArchivePeriod;
+  syncBtMode();
   loadBtFiles();
+  loadArchiveCache();
+}
+
+function syncBtMode() {
+  const archive = ($('bt_data_mode') || {}).value !== 'api';
+  const period = $('bt_archive_period');
+  if (period) period.closest('.field').classList.toggle('hidden', !archive);
+  const apiPeriod = $('bt_period_mode');
+  if (apiPeriod) apiPeriod.closest('.field').classList.toggle('hidden', archive);
+  if (archive) {
+    syncBtArchivePeriod();
+  } else {
+    ['bt_date_from', 'bt_date_to'].forEach((id) => {
+      const el = $(id);
+      if (el) el.closest('.field').classList.add('hidden');
+    });
+  }
+  syncBtPeriod();
+  const run = $('btnRunBacktest');
+  if (run) run.textContent = archive ? 'Скачать архивы и запустить' : 'Скачать и запустить';
+}
+
+function syncBtArchivePeriod() {
+  const archive = ($('bt_data_mode') || {}).value !== 'api';
+  const custom = ($('bt_archive_period') || {}).value === 'custom';
+  ['bt_date_from', 'bt_date_to'].forEach((id) => {
+    const el = $(id);
+    if (el) el.closest('.field').classList.toggle('hidden', !(archive && custom));
+  });
+  const hint = $('btArchiveHint');
+  if (hint) {
+    hint.textContent = archive
+      ? 'месяцы уже в кеше повторно не качаются; текущий месяц обновляется'
+      : '';
+  }
+}
+
+function btArchiveDates(period) {
+  const now = new Date();
+  const to = now.toISOString().slice(0, 10);
+  if (period === 'all') return { from: '2023-01-01', to };
+  const from = new Date(now.getTime());
+  from.setUTCFullYear(from.getUTCFullYear() - Number(period || 2));
+  return { from: from.toISOString().slice(0, 10), to };
 }
 
 function syncBtPeriod() {
+  const archive = ($('bt_data_mode') || {}).value !== 'api';
   const dates = ($('bt_period_mode') || {}).value === 'dates';
   const limitField = $('bt_limit_candles');
-  if (limitField) limitField.closest('.field').classList.toggle('hidden', dates);
+  if (limitField) limitField.closest('.field').classList.toggle('hidden', archive || dates);
+  if (archive) return;                    // датами управляет syncBtArchivePeriod
   ['bt_date_from', 'bt_date_to'].forEach((id) => {
     const el = $(id);
     if (el) el.closest('.field').classList.toggle('hidden', !dates);
@@ -773,12 +831,25 @@ function collectBacktestParams() {
   const params = {};
   document.querySelectorAll('[id^="bt_"]').forEach((el) => {
     const key = el.id.slice(3);
-    if (key === 'period_mode') return;
+    if (key === 'data_mode' || key === 'archive_period' || key === 'period_mode') return;
     const v = el.value;
     if (v === '') return;
     if (el.type === 'number') params[key] = parseFloat(v);
     else params[key] = v.trim();
   });
+  const mode = ($('bt_data_mode') || {}).value || 'archive';
+  if (mode === 'archive') {
+    // Глубокая история: сервер сам скачает месячные архивы Gate.io.
+    delete params.limit_candles;
+    const period = ($('bt_archive_period') || {}).value || '2';
+    if (period !== 'custom') {
+      const range = btArchiveDates(period);
+      params.date_from = range.from;
+      params.date_to = range.to;
+    }
+    params.source = 'archive';
+    return params;
+  }
   if (($('bt_period_mode') || {}).value === 'limit') {
     delete params.date_from;
     delete params.date_to;
@@ -897,6 +968,7 @@ function pollBacktest() {
     if (job.state === 'done' && job.result) {
       renderBacktestResult(job.result);
       $('btStatus').textContent = `${p.message || 'готово'} · id ${job.result_id}`;
+      loadArchiveCache();
     } else if (job.state === 'cancelled') {
       $('btStatus').textContent = 'остановлено';
     } else {
@@ -920,7 +992,51 @@ function setBtProgress(percent) {
 }
 
 function runBacktestFromExchange() {
-  startBacktest(collectBacktestParams(), 'скачиваю историю с Gate.io…');
+  const params = collectBacktestParams();
+  const label = params.source === 'archive'
+    ? 'скачиваю архивы Gate.io (первый раз — месяцами, дальше из кеша)…'
+    : 'скачиваю историю с Gate.io…';
+  startBacktest(params, label);
+}
+
+async function loadArchiveCache() {
+  const host = $('btArchiveCache');
+  if (!host) return;
+  let data = null;
+  try {
+    data = await api('GET', '/api/history/archive');
+  } catch (e) {
+    host.innerHTML = `<p class="muted">не удалось получить кеш архивов: ${escapeHtml(e.message)}</p>`;
+    return;
+  }
+  const items = data.items || [];
+  const hint = $('btArchiveHint');
+  if (hint) {
+    hint.textContent = items.length
+      ? `архивы с ${data.first_month ? data.first_month.slice(0, 4) + '-' + data.first_month.slice(4, 6) : '2023-01'} · лимит ${fmt(data.max_candles, 0)} свечей`
+      : 'кеш пуст — при первом запуске сервер скачает нужные месяцы';
+  }
+  if (!items.length) {
+    host.innerHTML = '<p class="muted">пока ничего не скачано: выберите период и нажмите «Скачать архивы и запустить»</p>';
+    return;
+  }
+  host.innerHTML = items.map((f) => `
+    <div class="bt-file">
+      <span><b>${escapeHtml(f.file)}</b>
+        <span class="muted">${escapeHtml(f.symbol)} · ${escapeHtml(f.market_type)} · ${escapeHtml(f.timeframe)} ·
+        ${fmt(f.count, 0)} свечей · ${f.from_utc || '—'} → ${f.to_utc || '—'} UTC · ${f.size_mb} МБ</span></span>
+      <span class="bt-file-actions">
+        <button class="btn btn-small" data-archive-del="${escapeHtml(f.key)}">Удалить</button>
+      </span>
+    </div>`).join('');
+  host.querySelectorAll('button[data-archive-del]').forEach((el) => {
+    el.onclick = async () => {
+      if (!confirm(`Удалить скачанную историю ${el.dataset.archiveDel}?`)) return;
+      await api('DELETE', '/api/history/archive/' + encodeURIComponent(el.dataset.archiveDel))
+        .catch(() => null);
+      loadArchiveCache();
+    };
+  });
 }
 
 function runBacktestFromCsv() {
@@ -964,12 +1080,15 @@ function renderBacktestResult(r) {
   }
   const info = $('btDataInfo');
   if (info) {
-    const real = d.source === 'gate';
+    const sourceLabel = d.source === 'archive'
+      ? `<b>Архив Gate.io${d.resampled_from ? ` (${d.resampled_from} → ${d.timeframe})` : ''}</b>`
+      : (d.source === 'gate' ? '<b>Реальная история Gate.io</b>'
+        : (d.source === 'csv' ? '<b>Ваш файл</b>' : 'Синтетические свечи'));
     info.innerHTML = d.count
-      ? `${real ? '<b>Реальная история Gate.io</b>' : (d.source === 'csv' ? '<b>Ваш файл</b>' : 'Синтетические свечи')}: ` +
-        `${fmt(d.count, 0)} свечей, ${d.from_utc} → ${d.to_utc} UTC (${d.span_days} дн.)` +
+      ? `${sourceLabel}: ${fmt(d.count, 0)} свечей, ${d.from_utc} → ${d.to_utc} UTC (${d.span_days} дн.)` +
+        (d.months_in_period ? ` · месяцев в периоде: ${d.months_in_period}, скачано сейчас: ${d.months_downloaded}` : '') +
         (d.gaps ? `, пропусков в данных: ${d.gaps}` : '') +
-        (d.file ? ` · файл <code>${escapeHtml(d.file)}</code>` : '')
+        (d.file ? ` · кеш <code>${escapeHtml(d.file)}</code>` : '')
       : '';
   }
   const tbody = $('btCycles').querySelector('tbody');

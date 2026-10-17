@@ -158,6 +158,14 @@ window.fetch = (url, opts) => {
 
     return Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve(JSON.stringify(body)) });
   }
+  if (url.includes('/api/history/archive')) {
+    body = { ok: true, first_month: '202301', max_candles: 2000000, items: [
+      { key: 'gate_futures_usdt_btc_usdt_5m', file: 'gate_futures_usdt_btc_usdt_5m.csv',
+        symbol: 'BTC/USDT', market_type: 'futures', timeframe: '5m', count: 210000,
+        from_utc: '2023-01-01 00:00', to_utc: '2026-10-16 23:55', size_mb: 18.4, months: 46 },
+    ] };
+    return Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve(JSON.stringify(body)) });
+  }
   if (url.includes('/api/backtest/files')) {
     if ((opts && opts.method) === 'POST') {
       uploaded = { body: (opts && opts.body) || null, type: ((opts && opts.headers) || {})['Content-Type'] };
@@ -191,7 +199,8 @@ window.ResizeObserver = class { observe() {} };
 /* ---- запуск ---- */
 // app.js объявлен в strict-режиме, поэтому его функции не попадают в window.
 // Для проверки советов отдаём одну функцию наружу (сам app.js не меняем).
-window.eval(js + '\nwindow.scanAdvice = scanAdvice; window.renderCostWarn = renderCostWarn;');
+window.eval(js + '\nwindow.scanAdvice = scanAdvice; window.renderCostWarn = renderCostWarn;'
+  + ' window.collectBacktestParams = collectBacktestParams;');
 window.document.dispatchEvent(new window.Event('DOMContentLoaded'));
 
 function check(name, cond, extra = '') {
@@ -215,6 +224,38 @@ setTimeout(async () => {
   check('подсказка цели знает, где 0 сетки',
     $('cTargetHint').textContent.includes('0 снизу'), $('cTargetHint').textContent);
   check('в бэктесте можно выбрать метод входа', !!$('bt_entry_mode') && $('bt_entry_mode').value === 'swing');
+  check('в бэктесте есть выбор источника данных',
+    !!$('bt_data_mode') && $('bt_data_mode').value === 'archive', $('bt_data_mode').value);
+  check('для архива скрыт лимит свечей и виден период',
+    $('bt_limit_candles').closest('.field').classList.contains('hidden')
+      && !$('bt_archive_period').closest('.field').classList.contains('hidden'));
+  await new Promise((r) => setTimeout(r, 200));
+  const cacheText = $('btArchiveCache').textContent.replace(/\u00a0/g, ' ');
+  check('в кеше показана скачанная история',
+    cacheText.includes('gate_futures_usdt_btc_usdt_5m') && cacheText.includes('210 000'),
+    cacheText.trim().slice(0, 90));
+
+  // архив: период «весь архив» превращается в даты 2023-01-01 … сегодня
+  $('bt_archive_period').value = 'all';
+  $('bt_archive_period').dispatchEvent(new window.Event('change'));
+  let btParams = window.collectBacktestParams();
+  check('архив уходит как source=archive с датами периода',
+    btParams.source === 'archive' && btParams.date_from === '2023-01-01'
+      && !!btParams.date_to && btParams.limit_candles === undefined,
+    JSON.stringify({ source: btParams.source, from: btParams.date_from, to: btParams.date_to }));
+
+  // API: возвращаются поля «сколько свечей»
+  $('bt_data_mode').value = 'api';
+  $('bt_data_mode').dispatchEvent(new window.Event('change'));
+  btParams = window.collectBacktestParams();
+  check('API-режим снова отдаёт source=gate и лимит свечей',
+    btParams.source === 'gate' && btParams.limit_candles >= 1
+      && !$('bt_limit_candles').closest('.field').classList.contains('hidden'),
+    JSON.stringify({ source: btParams.source, limit: btParams.limit_candles }));
+  $('bt_data_mode').value = 'archive';
+  $('bt_data_mode').dispatchEvent(new window.Event('change'));
+  $('bt_archive_period').value = '2';
+  $('bt_archive_period').dispatchEvent(new window.Event('change'));
   check('логика объясняет движение целиком',
     $('lgMode').textContent.includes('движение целиком') && $('lgLookback').textContent.trim() === '120',
     $('lgMode').textContent);
@@ -248,12 +289,20 @@ setTimeout(async () => {
   btTab.dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
   await new Promise((r) => setTimeout(r, 200));
   const hidden = (id) => $(id).closest('.field').classList.contains('hidden');
-  check('по умолчанию период задаётся количеством свечей', !hidden('bt_limit_candles') && hidden('bt_date_from'));
+  check('по умолчанию выбран архив с периодом 2 года',
+    $('bt_data_mode').value === 'archive' && $('bt_archive_period').value === '2'
+      && hidden('bt_period_mode') && hidden('bt_limit_candles'));
+  // переключаемся на короткий API-режим и проверяем его период
+  $('bt_data_mode').value = 'api';
+  $('bt_data_mode').dispatchEvent(new window.Event('change'));
+  check('API: период задаётся количеством свечей', !hidden('bt_limit_candles') && hidden('bt_date_from'));
   $('bt_period_mode').value = 'dates';
   $('bt_period_mode').dispatchEvent(new window.Event('change'));
   check('переключение на даты показывает поля периода', hidden('bt_limit_candles') && !hidden('bt_date_from'));
   $('bt_period_mode').value = 'limit';
   $('bt_period_mode').dispatchEvent(new window.Event('change'));
+  $('bt_data_mode').value = 'archive';
+  $('bt_data_mode').dispatchEvent(new window.Event('change'));
   check('список своих CSV-файлов загружен', $('btFiles').textContent.includes('gate_btcusdt_futures_5m'),
     $('btFiles').textContent.slice(0, 60));
 

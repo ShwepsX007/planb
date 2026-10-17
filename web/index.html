@@ -208,9 +208,16 @@
       <div class="bt-sources">
         <div class="bt-source">
           <h3>1. Свечи с биржи Gate.io</h3>
-          <p class="muted">Данные качает сам сервер прямо с биржи (публичный API, API-ключи не нужны) —
-          вам не нужно ничего искать и загружать. Даты — в UTC.</p>
+          <p class="muted">Сервер сам берёт данные с Gate.io, ключи не нужны. <b>Архив</b> —
+          официальные месячные файлы с 2023 года: любой период, годы истории, кешируется на
+          сервере (повторный прогон — сразу). <b>API</b> — быстрый способ для последних
+          ~10 000 свечей. Даты — в UTC.</p>
           <div class="bt-form" id="btForm"></div>
+          <div class="bt-archive">
+            <div class="box-head"><h4>Уже скачано в кеш</h4>
+              <span class="muted" id="btArchiveHint"></span></div>
+            <div id="btArchiveCache" class="bt-files"></div>
+          </div>
         </div>
         <div class="bt-source">
           <h3>2. Или свои свечи (CSV / ZIP-архив)</h3>

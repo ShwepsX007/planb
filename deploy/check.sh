@@ -284,6 +284,30 @@ else
     info "попробуйте вручную:  curl -s -m 15 '$GATE_URL' | head -c 300"
 fi
 
+# ------------------------------------------------- 9. архивы истории Gate.io
+head_ "9. Глубокая история для бэктеста (download.gatedata.org)"
+ARCHIVE_URL="${PLANB_ARCHIVE_BASE:-https://download.gatedata.org}/futures_usdt/candlesticks_5m/202401/BTC_USDT-202401.csv.gz"
+ARCHIVE_CODE="$(curl -s -o /dev/null -r 0-1023 -w '%{http_code}' --max-time 20 "$ARCHIVE_URL" 2>/dev/null || true)"
+[ -z "$ARCHIVE_CODE" ] && ARCHIVE_CODE=000
+case "$ARCHIVE_CODE" in
+    200|206)
+        ok "сервер видит архивы Gate.io — в бэктесте доступны годы истории (с 2023)"
+        ;;
+    404)
+        info "сервер отвечает, но файла 2024-01 нет (HTTP 404) — проверьте пару/рынок в панели"
+        ;;
+    000)
+        bad "с сервера нет связи с download.gatedata.org — глубокие архивы не скачаются"
+        info "обычный API и бот при этом работают; для архивов проверьте DNS/исходящий трафик:"
+        info "  curl -I --max-time 20 '$ARCHIVE_URL'"
+        info "если хостинг блокирует адрес — задайте своё зеркало: PLANB_ARCHIVE_BASE=https://... в .env"
+        ;;
+    *)
+        bad "архив Gate.io ответил кодом $ARCHIVE_CODE"
+        info "проверьте вручную:  curl -I --max-time 20 '$ARCHIVE_URL'"
+        ;;
+esac
+
 # ------------------------------------------------------------------- итоги
 head_ "Итог"
 if [ "$PROBLEMS" -eq 0 ]; then

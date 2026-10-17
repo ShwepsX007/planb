@@ -706,6 +706,8 @@ class BotRuntime:
         aliases = {"": "synthetic" if bt_settings.synthetic_data else "gate",
                    "demo": "synthetic", "synthetic": "synthetic", "synth": "synthetic",
                    "gate": "gate", "exchange": "gate", "real": "gate", "market": "gate",
+                   "archive": "archive", "gate_archive": "archive", "deep": "archive",
+                   "history": "archive", "bulk": "archive",
                    "csv": "csv", "file": "csv", "upload": "csv"}
         if source not in aliases:
             source = "gate"
@@ -758,9 +760,19 @@ class BotRuntime:
             info.update(describe_candles(candles, req.timeframe))
             return candles, info
 
+        warnings: List[str] = []
+        if req.source == "archive":
+            # Глубокая история: месячные архивы Gate.io (2023 → сейчас).
+            # Обычный API отдаёт только последние ~10 000 свечей, архивы — годы.
+            from .gate_archive import sync_archive
+            job["progress"] = {"candles": 0, "total": None, "percent": None,
+                               "message": "скачиваю архивы Gate.io…"}
+            candles, info = await sync_archive(req, progress=progress, warnings=warnings)
+            info.setdefault("warnings", warnings)
+            return candles, info
+
         job["progress"] = {"candles": 0, "total": None, "percent": None,
                            "message": "скачиваю историю с Gate.io…"}
-        warnings: List[str] = []
         candles = await download_candles(bt_settings, req, progress=progress, warnings=warnings)
         name = downloaded_filename(req)
         try:
