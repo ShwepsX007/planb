@@ -619,6 +619,8 @@ class BotRuntime:
                 "low": cycle.swing_low,
                 "high": cycle.swing_high,
                 "goal_pct": cycle.goal_pct,
+                "move_side": cycle.move_side,
+                "zero_at": "low" if cycle.move_side == "down" else "high",
                 "levels": [{"level": cycle.goal_pct, "price": cycle.target, "label": "цель"}],
             }
         return {
@@ -662,9 +664,9 @@ class BotRuntime:
         if cycle is not None:
             levels = [
                 {"level": lv["level"], "price": lv["price"], "label": lv["label"]}
-                for lv in fib_grid(cycle.swing_low, cycle.swing_high)
+                for lv in fib_grid(cycle.swing_low, cycle.swing_high,
+                                   move_side=cycle.move_side)
             ]
-            levels.append({"level": cycle.goal_pct / 100.0, "price": cycle.target, "label": "цель", "highlight": True})
             for pos in cycle.positions:
                 mult = pos.multiplier
                 label = f"{pos.idx}" + (f" x{mult:g}" if mult > 1 else "")
@@ -686,6 +688,8 @@ class BotRuntime:
             "target": cycle.target if cycle else None,
             "swing": {"low": cycle.swing_low, "high": cycle.swing_high} if cycle else None,
             "side": cycle.side if cycle else None,
+            "move_side": cycle.move_side if cycle else None,
+            "grid_zero": ("low" if cycle.move_side == "down" else "high") if cycle else None,
             "timeframe": self.settings.timeframe,
         }
 

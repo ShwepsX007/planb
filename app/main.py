@@ -33,11 +33,13 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         "data_source": "gate",
         "trade_mode": "paper",
         "timeframe": "5m",
+        "entry_mode": "swing",
         "candles_count": 3,
         # пороги подобраны под реальный BTC: на 5m три свечи дают движение
         # примерно 0.3-1.5%, поэтому 0.6% — вход несколько раз за сутки,
         # а не «раз в месяц». Свои значения можно подобрать сканером сигналов.
         "min_move_pct": 0.6,
+        "min_correction_pct": 5.0,
         "fib_goal_pct": 50.0,
         "min_profit_pct": 0.15,
         "base_volume_usd": 10.0,

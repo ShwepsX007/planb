@@ -43,7 +43,14 @@ class BotSettings(BaseModel):
     timeframe: str = "5m"
 
     # ------------------------------------------------------------------ strategy
+    entry_mode: Literal["swing", "impulse"] = "swing"
     candles_count: int = Field(default=3, ge=1, le=50, description="свечей в одну сторону")
+    swing_lookback: int = Field(default=120, ge=10, le=500,
+                                description="сколько свечей просматривать при поиске движения")
+    swing_fresh_candles: int = Field(default=24, ge=2, le=200,
+                                     description="насколько свежим должен быть экстремум движения")
+    min_correction_pct: float = Field(default=5.0, ge=0, le=95,
+                                      description="минимальная коррекция для входа, % сетки")
     min_move_pct: float = Field(default=1.2, gt=0, le=1000, description="минимальный % движения")
     fib_goal_pct: float = Field(default=50.0, gt=0, le=618, description="цель, уровень коррекции по фибо, %")
     min_profit_pct: float = Field(default=0.5, gt=0, le=100, description="минимальный % профита")
@@ -120,10 +127,23 @@ class BotSettings(BaseModel):
             raise ValueError("символ не может быть пустым")
         return v
 
+    @field_validator("entry_mode", mode="before")
+    @classmethod
+    def _norm_entry_mode(cls, v: Any) -> Any:
+        """Старое значение (N свечей) принимаем как impulse, всё остальное — swing."""
+        if not isinstance(v, str):
+            return v
+        alias = {"impulse": "impulse", "candles": "impulse", "n": "impulse",
+                 "swing": "swing", "leg": "swing", "movement": "swing",
+                 "swing_leg": "swing", "": "swing"}
+        return alias.get(v.strip().lower(), "swing")
+
     @model_validator(mode="after")
     def _check_positions(self) -> "BotSettings":
         if self.multiplier_start_position > self.max_positions:
             self.multiplier_start_position = self.max_positions
+        if self.swing_lookback < self.candles_count * 2:
+            self.swing_lookback = self.candles_count * 2
         if self.market_type == "spot" and self.direction == "short":
             self.direction = "long"
         if self.trade_mode == "live" and self.synthetic_data:

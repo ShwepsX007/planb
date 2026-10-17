@@ -16,6 +16,7 @@ from app.strategy import StrategyEngine
 def settings(**kwargs) -> BotSettings:
     base = dict(
         symbol="BTC/USDT", market_type="futures", timeframe="5m",
+        entry_mode="impulse",          # эти сценарии проверяют старый метод N свечей
         candles_count=3, min_move_pct=1.0, fib_goal_pct=50.0, min_profit_pct=1.0,
         base_volume_usd=10.0, volume_multiplier=2.0, multiplier_start_position=3,
         max_positions=6, direction="long", fee_pct=0.0, slippage_pct=0.0,

@@ -70,10 +70,13 @@ class Cycle:
     signal_ts: int
     signal_price: float           # close of the impulse's last candle
     opened_ts: int
-    swing_high: float             # fib 100%
-    swing_low: float              # fib 0%
+    swing_high: float             # максимум движения
+    swing_low: float              # минимум движения
     goal_pct: float               # fib correction target (e.g. 50)
     target: float                 # price of the target level
+    #: направление самого движения: "down" (0% внизу, лонг) или "up" (0% вверху, шорт).
+    #: от него зависит, с какой стороны отсчитываются уровни сетки.
+    move_side: str = "down"
     positions: List[Position] = field(default_factory=list)
     status: str = "open"          # open | closed
     closed_ts: Optional[int] = None

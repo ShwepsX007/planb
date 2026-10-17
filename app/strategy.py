@@ -42,7 +42,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence
 
 from .config import BotSettings
-from .fib import _is_down, _is_up, detect_impulse, fib_level
+from .fib import _is_down, _is_up, detect_signal, retrace_price
 from .models import Action, Candle, Cycle, Fill, Position, Side, now_ms
 
 
@@ -95,7 +95,8 @@ class StrategyEngine:
         self.last_price = price
         if self.stopped or self.cycle is None:
             return []
-        return self._exit_checks(self.cycle, high=price, low=price, open_price=price, ts=now_ms())
+        return self._exit_checks(self.cycle, high=price, low=price, open_price=price,
+                                 ts=now_ms(), close_price=price)
 
     def on_candle(self, candle: Candle) -> List[Action]:
         """Process a single *closed* candle."""
@@ -104,7 +105,7 @@ class StrategyEngine:
             return []
 
         if self.cycle is None:
-            impulse, reason = detect_impulse(self.candles, self.settings)
+            impulse, reason = detect_signal(self.candles, self.settings)
             self.last_check = reason
             if impulse is None:
                 return []
@@ -127,9 +128,12 @@ class StrategyEngine:
             swing_low=impulse.low,
             goal_pct=s.fib_goal_pct,
             target=impulse.target,
+            move_side=impulse.move_side,
             extreme_at_last_entry=impulse.low if impulse.side == "long" else impulse.high,
-            note=(f"{impulse.candles} свечей {impulse.move_side} {impulse.move_pct:.2f}% "
-                  f"[{impulse.low:g}..{impulse.high:g}]"),
+            note=(f"{'движение целиком' if impulse.mode == 'swing' else 'импульс'}: "
+                  f"{impulse.candles} свечей {impulse.move_side} {impulse.move_pct:.2f}% "
+                  f"[{impulse.low:g}..{impulse.high:g}]"
+                  + (f", коррекция {impulse.correction_pct:.1f}%" if impulse.mode == "swing" else "")),
         )
         self.cycle = cycle
         volume = s.volume_for_position(1)
@@ -158,12 +162,14 @@ class StrategyEngine:
                 cycle.swing_high = candle.high
             if s.update_swing_in_cycle and candle.low < cycle.swing_low:
                 cycle.swing_low = candle.low
-        cycle.target = fib_level(cycle.swing_low, cycle.swing_high, cycle.goal_pct)
+        cycle.target = retrace_price(cycle.swing_low, cycle.swing_high,
+                                     cycle.move_side, cycle.goal_pct)
         cycle.max_positions_used = max(cycle.max_positions_used, len(cycle.positions))
 
         # 2. target / stop-loss -------------------------------------------------
         actions = self._exit_checks(cycle, high=candle.high, low=candle.low,
-                                    open_price=candle.open, ts=candle.ts)
+                                    open_price=candle.open, ts=candle.ts,
+                                    close_price=candle.close)
         if actions:
             return actions
 
@@ -177,6 +183,22 @@ class StrategyEngine:
             if profit_pct <= s.min_profit_pct + 1e-9 and guard_ok:
                 idx = len(cycle.positions) + 1
                 volume = s.volume_for_position(idx)
+                # Долив имеет смысл, только если ПОСЛЕ усреднения профит до цели
+                # будет не меньше минимума. Иначе цикл становится безнадёжным:
+                # средняя подходит к цели вплотную, и «профита по цели» не будет
+                # никогда — именно так сделка «висит» (см. скриншот с целью 0.0002%).
+                qty_now = cycle.total_qty
+                add_qty = volume / candle.close if candle.close > 0 else 0.0
+                new_avg = ((avg * qty_now + candle.close * add_qty) / (qty_now + add_qty)
+                           if qty_now + add_qty > 0 else avg)
+                profit_after = (new_avg and (
+                    (cycle.target / new_avg - 1.0) * 100.0 if cycle.side == "long"
+                    else (1.0 - cycle.target / new_avg) * 100.0))
+                if profit_after < s.min_profit_pct - 1e-9:
+                    self.last_check = (f"долив #{idx} не поможет: после усреднения профит до цели "
+                                       f"{profit_after:.2f}% < {s.min_profit_pct:g}% — "
+                                       f"ждём новый экстремум/откат")
+                    return []
                 self.last_check = (f"долив #{idx}: профит до цели {profit_pct:.2f}% "
                                    f"<= {s.min_profit_pct:g}%, средняя {avg:g}")
                 return [Action(
@@ -200,40 +222,77 @@ class StrategyEngine:
         return []
 
     def _exit_checks(self, cycle: Cycle, *, high: float, low: float,
-                     open_price: float, ts: int) -> List[Action]:
+                     open_price: float, ts: int,
+                     close_price: Optional[float] = None) -> List[Action]:
         s = self.settings
         if not cycle.positions:
             return []
+        long = cycle.side == "long"
         avg = cycle.avg_entry
         target = cycle.target
         maxed = len(cycle.open_positions) >= s.max_positions
-        profit_pct = cycle.profit_pct_to(target)
-        armed = True
-        if s.tp_requires_min_profit:
-            armed = profit_pct >= s.min_profit_pct - 1e-9
-        if maxed and s.close_at_target_when_maxed:
-            armed = True
-        profitable = (target > avg) if cycle.side == "long" else (target < avg)
 
         # emergency stop of the cycle
         if s.cycle_stop_loss_pct > 0:
-            loss_pct = -cycle.profit_pct_to(cycle.last_entry_price if cycle.side == "long" else
-                                            cycle.last_entry_price)
-            price_for_sl = low if cycle.side == "long" else high
-            adverse = ((avg - price_for_sl) / avg * 100.0) if cycle.side == "long" else \
+            price_for_sl = low if long else high
+            adverse = ((avg - price_for_sl) / avg * 100.0) if long else \
                       ((price_for_sl - avg) / avg * 100.0)
             if adverse >= s.cycle_stop_loss_pct:
                 return [Action(kind="close_all", side=cycle.side, ref_price=price_for_sl,
                                qty=cycle.total_qty, reason="стоп-лосс", ts=ts)]
 
+        # 1. Дошла ли цена до цели в этом такте/свече?
+        target_touched = (high >= target) if long else (low <= target)
+        if not target_touched:
+            self._note_target_wait(cycle, avg, target)
+            return []
+
+        # 2. Какую цену реально можно получить СЕЙЧАС?
+        #    Раньше прибыль считалась только «до цели». Если цель совпала со средней
+        #    (типичный случай после усреднений), профит до неё ~0 — и бот игнорировал
+        #    даже резкий уход цены далеко в нужную сторону: сделка «зависала».
+        now_price = close_price if close_price not in (None, 0) else open_price
+        now_price = max(low, min(high, float(now_price)))
+        if long:
+            best = max(now_price, target)          # текущая цена, но не ниже цели
+            best = min(best, high)
+        else:
+            best = min(now_price, target)
+            best = max(best, low)
+        profit_best = cycle.profit_pct_to(best)
+
+        armed = True
+        if s.tp_requires_min_profit:
+            armed = profit_best >= s.min_profit_pct - 1e-9
+        if maxed and s.close_at_target_when_maxed:
+            # лимит позиций: закрываем по цели, как только это вообще в плюс
+            armed = True
+        profitable = (best > avg) if long else (best < avg)
+
         if armed and profitable:
-            hit = (high >= target) if cycle.side == "long" else (low <= target)
-            if hit:
-                ref = max(target, open_price) if cycle.side == "long" else min(target, open_price)
-                return [Action(kind="close_all", side=cycle.side, ref_price=ref,
-                               qty=cycle.total_qty,
-                               reason=f"цель по фибо {cycle.goal_pct:g}% = {target:g}", ts=ts)]
+            reason = (f"цель по фибо {cycle.goal_pct:g}% = {target:g}"
+                      + (f" (цена {best:g}, лучше цели)" if (
+                          best > target if long else best < target) else ""))
+            return [Action(kind="close_all", side=cycle.side, ref_price=best,
+                           qty=cycle.total_qty, reason=reason, ts=ts)]
+
+        # цель достигнута, но профита пока мало — говорим об этом пользователю,
+        # а не молчим: именно это выглядело как «сделка висит»
+        self.last_check = (f"цель {target:g} достигнута, но профит {profit_best:.2f}% "
+                           f"< минимума {s.min_profit_pct:g}% — держим и ждём цену "
+                           f"{'выше' if long else 'ниже'}")
         return []
+
+    def _note_target_wait(self, cycle: Cycle, avg: float, target: float) -> None:
+        """Понятный статус, пока цена не дошла до цели."""
+        profit_pct = cycle.profit_pct_to(target)
+        if profit_pct < 0:
+            where = "ниже" if cycle.side == "long" else "выше"
+            self.last_check = (f"цель {target:g} {where} средней {avg:g}: профита по цели нет, "
+                               f"ждём долива/отката")
+            return
+        self.last_check = (f"в позиции, профит до цели {profit_pct:.2f}% "
+                           f"(мин. {self.settings.min_profit_pct:g}%)")
 
     # ------------------------------------------------------------------- fills
     def apply_fill(self, action: Action, fill: Fill) -> Position:
@@ -255,7 +314,8 @@ class StrategyEngine:
         cycle.positions.append(pos)
         cycle.extreme_at_last_entry = cycle.swing_low if cycle.side == "long" else cycle.swing_high
         cycle.max_positions_used = max(cycle.max_positions_used, len(cycle.positions))
-        cycle.target = fib_level(cycle.swing_low, cycle.swing_high, cycle.goal_pct)
+        cycle.target = retrace_price(cycle.swing_low, cycle.swing_high,
+                                     cycle.move_side, cycle.goal_pct)
         return pos
 
     def close_cycle(self, price: float, ts: int, reason: str, *, qty: Optional[float] = None,
@@ -405,6 +465,8 @@ class StrategyEngine:
             opened_ts=raw.get("opened_ts", 0),
             swing_high=raw.get("swing_high", 0.0),
             swing_low=raw.get("swing_low", 0.0),
+            # старые сохранённые циклы не знали направления — выводим его из стороны
+            move_side=raw.get("move_side") or ("down" if raw.get("side", "long") == "long" else "up"),
             goal_pct=raw.get("goal_pct", self.settings.fib_goal_pct),
             target=raw.get("target", 0.0),
             positions=positions,
@@ -441,7 +503,7 @@ def scan_signals(candles: Sequence[Candle], settings, *, sample: int = 5) -> Dic
         else:
             move_pct = abs(window[-1].close - window[0].open) / window[0].open * 100.0
         moves.append(move_pct)
-        impulse, reason = detect_impulse(candles[:i], settings)
+        impulse, reason = detect_signal(candles[:i], settings)
         last_reason = reason
         if impulse is not None:
             signals.append({"ts": window[-1].ts, "side": impulse.side,

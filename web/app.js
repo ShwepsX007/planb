@@ -140,7 +140,10 @@ function renderSnapshot(s) {
   $('cAvgHint').textContent = c ? `позиций: ${c.positions.length} · объём ${fmt(c.total_volume_usd, 2)} $` : 'позиций: 0';
 
   $('cTarget').textContent = c ? fmt(c.target, 2) : '—';
-  $('cTargetHint').textContent = c ? `уровень ${c.goal_pct}% · сетка ${fmt(c.swing_low, 2)}–${fmt(c.swing_high, 2)}` : 'уровень —';
+  $('cTargetHint').textContent = c
+    ? `уровень ${c.goal_pct}% · сетка ${fmt(c.swing_low, 2)}–${fmt(c.swing_high, 2)}` +
+      (c.move_side === 'up' ? ' (0 сверху)' : ' (0 снизу)')
+    : 'уровень —';
 
   $('cProfitToTarget').textContent = c ? pct(c.profit_pct_to_target) : '—';
   $('cProfitToTarget').className = 'card-value ' + (c ? (c.profit_pct_to_target >= (app.settings?.min_profit_pct ?? 0) ? 'pos' : 'neg') : '');
@@ -199,9 +202,9 @@ function renderStateHint(s, e, c) {
       `(${scan.candles} свечей ${scan.timeframe}${hours ? `, ≈ ${hours} ч` : ''}) стратегия не нашла ` +
       `ни одного сигнала: движения были от ${fmt(scan.move_median_pct, 2)} % (медиана) до ` +
       `${fmt(scan.move_max_pct, 2)} % (максимум), а порог входа — ${fmt(scan.threshold_pct, 2)} %. ` +
-      `Уменьшите «Минимальное движение цены» на вкладке «Настройки» (например до ` +
-      `${suggestThreshold(scan)}) или возьмите таймфрейм крупнее — тогда входов станет больше. ` +
-      `<button class="btn btn-small" id="btnScanSignals">Проверить сигналы заново</button>`;
+      (scan.last_reason ? `<br><b>Причина:</b> ${escapeHtml(scan.last_reason)}. ` : '') +
+      scanAdvice(scan) +
+      ` <button class="btn btn-small" id="btnScanSignals">Проверить сигналы заново</button>`;
   } else if (s.status === 'target_reached') {
     kind = 'ok';
     html = `<b>Цель по общему профиту достигнута</b> (${fmt(e.realized_pnl, 4)} $). ` +
@@ -221,6 +224,30 @@ function renderStateHint(s, e, c) {
   box.innerHTML = html;
   const scanButton = $('btnScanSignals');
   if (scanButton) scanButton.onclick = scanSignalsNow;
+}
+
+function scanAdvice(scan) {
+  // совет зависит от причины, которую назвал сам детектор, — без угадывания.
+  // Порядок важен: «коррекция ... уже дошла до цели» содержит слово «коррекция»,
+  // но совет там другой, поэтому специфичные причины идут первыми.
+  const reason = String(scan.last_reason || '');
+  const rules = [
+    ['поздно', 'Цена уже прошла цель коррекции — ждите нового движения или уменьшите «Цель по Фибо».'],
+    ['продолжается', 'Движение ещё не закончилось: ждём откат, входить не на чем.'],
+    ['вернулась к началу', 'Цена откатилась к началу движения — ждите нового движения.'],
+    ['свежести', 'Увеличьте «Экстремум не старше, свечей» или окно поиска движения.'],
+    ['рано', 'Уменьшите «Мин. коррекция для входа» — цена ещё не отошла от экстремума.'],
+    ['мало свечей', 'Бот ещё набирает историю — данные появятся в течение минуты.'],
+    ['зигзаг', 'Движение не выражено: уменьшите «Минимальное движение цены» или берите таймфрейм крупнее.'],
+    ['отключено', 'Включите нужное направление в настройках (long/short).'],
+    ['профит до цели', 'Уменьшите «Минимальный профит» или «Цель по Фибо» — до цели слишком близко.'],
+    ['порога', `Уменьшите «Минимальное движение цены» (например до ${suggestThreshold(scan)}) ` +
+      'или возьмите таймфрейм крупнее — тогда входов станет больше.'],
+  ];
+  for (const [needle, advice] of rules) {
+    if (reason.includes(needle)) return advice;
+  }
+  return 'Откройте «Настройки» и проверьте пороги входа.';
 }
 
 function scanFresh(s) {
@@ -338,7 +365,16 @@ function renderCurrentPositions(c) {
 
 function renderLogic(s) {
   const st = app.settings || {};
+  const swing = (st.entry_mode || 'swing') !== 'impulse';
+  const modeEl = $('lgMode');
+  if (modeEl) {
+    modeEl.textContent = swing
+      ? 'движение целиком: от предыдущего максимума до последнего минимума (или наоборот)'
+      : `N свечей в одну сторону (${st.candles_count ?? '—'} шт.)`;
+  }
   $('lgCandles').textContent = st.candles_count ?? '—';
+  const lookEl = $('lgLookback');
+  if (lookEl) lookEl.textContent = st.swing_lookback ?? '—';
   $('lgTf').textContent = s.timeframe || '—';
   $('lgMove').textContent = st.min_move_pct ?? '—';
   $('lgGoal').textContent = st.fib_goal_pct ?? '—';
@@ -538,7 +574,17 @@ const FIELDS = [
   ] },
   { group: 'Данные и сигнал', fields: [
     { k: 'timeframe', l: 'Таймфрейм', t: 'tf' },
-    { k: 'candles_count', l: 'Количество свечей в одну сторону', t: 'number', step: 1, min: 1, max: 50, int: true },
+    { k: 'entry_mode', l: 'Метод поиска движения', t: 'select',
+      o: [['swing', 'Движение целиком (сетка по всему ходу цены)'],
+          ['impulse', 'N свечей в одну сторону (старый метод)']],
+      h: 'swing: сетка тянется от предыдущего максимума до последнего минимума (и наоборот), вход на коррекции' },
+    { k: 'swing_lookback', l: 'Окно поиска движения, свечей', t: 'number', step: 10, min: 10, max: 500, int: true,
+      h: 'сколько свечей назад искать начало движения (swing)' },
+    { k: 'swing_fresh_candles', l: 'Экстремум не старше, свечей', t: 'number', step: 1, min: 2, max: 200, int: true,
+      h: 'движение считается свежим, если его минимум/максимум был не раньше (swing)' },
+    { k: 'min_correction_pct', l: 'Мин. коррекция для входа, % сетки', t: 'number', step: 1, min: 0, max: 95,
+      h: 'вход только когда цена отошла от экстремума (0 — входить у экстремума, как раньше)' },
+    { k: 'candles_count', l: 'Свечей в одну сторону / минимум в движении', t: 'number', step: 1, min: 1, max: 50, int: true },
     { k: 'min_move_pct', l: 'Минимальное движение цены, %', t: 'number', step: 0.1, min: 0.01 },
     { k: 'fib_goal_pct', l: 'Цель: уровень коррекции по Фибо, %', t: 'number', step: 1, min: 1, h: '50 % — середина сетки' },
     { k: 'min_profit_pct', l: 'Минимальный профит, %', t: 'number', step: 0.05, min: 0.01 },
@@ -628,6 +674,11 @@ let btJobId = null;
 let btTimer = null;
 
 const BT_STRATEGY_FIELDS = [
+  ['entry_mode', 'Метод входа', 'select',
+    [['swing', 'Движение целиком (сетка по всему ходу)'], ['impulse', 'N свечей в одну сторону']]],
+  ['swing_lookback', 'Окно поиска движения, свечей', 'number'],
+  ['swing_fresh_candles', 'Экстремум не старше, свечей', 'number'],
+  ['min_correction_pct', 'Мин. коррекция для входа, %', 'number'],
   ['candles_count', 'Свечей в одну сторону', 'number'],
   ['min_move_pct', 'Мин. движение, %', 'number'],
   ['fib_goal_pct', 'Цель по Фибо, %', 'number'],

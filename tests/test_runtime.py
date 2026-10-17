@@ -16,6 +16,7 @@ def make_settings(**kwargs) -> BotSettings:
     base = dict(
         symbol="BTC/USDT", market_type="futures", timeframe="1m", data_source="demo",
         demo_speed=120, trade_mode="paper", poll_interval_sec=1.0, candles_count=3,
+        entry_mode="impulse",          # сценарии используют простой импульс из 3 свечей
         min_move_pct=0.4, min_profit_pct=0.2, base_volume_usd=10.0, max_positions=6,
         total_profit_target_usd=0.0, paper_balance_usd=1000.0,
     )

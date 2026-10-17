@@ -22,11 +22,12 @@ const errors = [];
 window.addEventListener('error', (e) => errors.push('window.error: ' + e.message));
 
 /* ---- фейковая библиотека графиков ---- */
+const drawnLines = [];
 function series() {
   const s = {
     setData: () => {}, setMarkers: () => {},
-    createPriceLine: (o) => ({ remove: () => {} , o}),
-    removePriceLine: () => {},
+    createPriceLine: (o) => { drawnLines.push(o); return { remove: () => {}, o }; },
+    removePriceLine: (l) => { if (l && l.o) { const i = drawnLines.indexOf(l.o); if (i >= 0) drawnLines.splice(i, 1); } },
   };
   return s;
 }
@@ -81,6 +82,7 @@ const snapshot = {
 
 const settings = {
   timeframe: '5m', timeframes: ['1m','5m','15m','1h'], candles_count: 3, min_move_pct: 1.2,
+  entry_mode: 'swing', swing_lookback: 120, swing_fresh_candles: 24, min_correction_pct: 5,
   fib_goal_pct: 50, min_profit_pct: 0.5, base_volume_usd: 10, volume_multiplier: 2,
   multiplier_start_position: 3, max_positions: 6, total_profit_target_usd: 50, direction: 'both',
   market_type: 'futures', symbol: 'BTC/USDT', data_source: 'gate', trade_mode: 'live',
@@ -94,10 +96,10 @@ const settings = {
 };
 const candles = {
   candles: Array.from({ length: 60 }, (_, i) => [Date.now() - (60 - i) * 300000, 59000 + i, 59200 + i, 58900 + i, 59100 + i, 10]),
-  levels: [0, 0.236, 0.382, 0.5, 0.618, 0.786, 1].map((l) => ({ level: l, price: 58600 + l * 1500, label: String(l) }))
-    .concat([{ level: 0.5, price: 59350, label: 'цель', highlight: true }]),
+  levels: [0, 0.236, 0.382, 0.5, 0.618, 0.786, 1].map((l) => ({ level: l, price: 58600 + l * 1500, label: String(l) })),
   markers: [{ ts: Date.now() - 800000, price: 59300, text: '1', kind: 'entry', side: 'long' }],
-  avg_entry: 59050, target: 59350, swing: { low: 58600, high: 60100 }, side: 'long', timeframe: '5m',
+  avg_entry: 59050, target: 59350, swing: { low: 58600, high: 60100 }, side: 'long',
+  move_side: 'down', grid_zero: 'low', timeframe: '5m',
 };
 
 const btFiles = { ok: true, files: [
@@ -187,7 +189,9 @@ window.alert = () => {};
 window.ResizeObserver = class { observe() {} };
 
 /* ---- запуск ---- */
-window.eval(js);
+// app.js объявлен в strict-режиме, поэтому его функции не попадают в window.
+// Для проверки советов отдаём одну функцию наружу (сам app.js не меняем).
+window.eval(js + '\nwindow.scanAdvice = scanAdvice;');
 window.document.dispatchEvent(new window.Event('DOMContentLoaded'));
 
 function check(name, cond, extra = '') {
@@ -205,6 +209,15 @@ setTimeout(async () => {
   check('форма настроек построена', window.document.querySelectorAll('#settingsForm .field').length > 20,
     window.document.querySelectorAll('#settingsForm .field').length + ' полей');
   check('форма бэктеста построена', window.document.querySelectorAll('#btForm .field').length > 10);
+  check('в настройках есть выбор метода входа', !!$('set_entry_mode') && $('set_entry_mode').value === 'swing',
+    $('set_entry_mode') ? $('set_entry_mode').value : 'нет поля');
+  check('в настройках есть минимальная коррекция', !!$('set_min_correction_pct'));
+  check('подсказка цели знает, где 0 сетки',
+    $('cTargetHint').textContent.includes('0 снизу'), $('cTargetHint').textContent);
+  check('в бэктесте можно выбрать метод входа', !!$('bt_entry_mode') && $('bt_entry_mode').value === 'swing');
+  check('логика объясняет движение целиком',
+    $('lgMode').textContent.includes('движение целиком') && $('lgLookback').textContent.trim() === '120',
+    $('lgMode').textContent);
   check('статус в шапке', text('statusBadge') === 'работает', text('statusBadge'));
   check('режим LIVE', text('modeBadge') === 'LIVE', text('modeBadge'));
   check('пара', text('pairInfo').includes('BTC/USDT'), text('pairInfo'));
@@ -280,6 +293,10 @@ setTimeout(async () => {
   chartTab.dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
   await new Promise((r) => setTimeout(r, 400));
   check('график запросил свечи', calls.some((c) => c.includes('/api/candles')));
+  const targets = drawnLines.filter((l) => l.title === 'цель');
+  check('линия цели на графике одна', targets.length === 1, `линий цели: ${targets.length}`);
+  check('уровни сетки нарисованы', drawnLines.filter((l) => l.title !== 'цель' && l.title !== 'средняя').length >= 7,
+    `линий: ${drawnLines.length}`);
   check('вкладка графика активна', $('tab-chart').classList.contains('active'));
   check('вкладка панели скрыта', !$('tab-dashboard').classList.contains('active'));
 
@@ -308,6 +325,19 @@ setTimeout(async () => {
     !banner.classList.contains('hidden') && banner.textContent.includes('Свечи идут, но входов нет')
       && banner.textContent.includes('0,12') && banner.textContent.includes('0,60'),
     banner.textContent.slice(0, 120));
+  check('совет соответствует причине',
+    window.scanAdvice({ last_reason: 'коррекция 62.0% уже дошла до цели — входить поздно' })
+      .includes('прошла цель')
+    && window.scanAdvice({ last_reason: 'падение ещё продолжается — коррекции нет' })
+      .includes('не закончилось')
+    && window.scanAdvice({ last_reason: 'коррекция 3.0% < минимальной 5% — цена ещё у экстремума, входить рано' })
+      .includes('Мин. коррекция')
+    && window.scanAdvice({ last_reason: 'экстремум движения был 90 свечей назад (порог свежести 24)' })
+      .includes('Экстремум не старше'),
+    window.scanAdvice({ last_reason: 'коррекция 3.0% < минимальной 5% — цена ещё у экстремума, входить рано' }));
+  check('в подсказке видна причина и что менять',
+    banner.textContent.includes('Причина:') && banner.textContent.includes('Минимальное движение'),
+    banner.textContent.slice(0, 220));
   check('есть кнопка проверки сигналов', !!$('btnScanSignals'));
   check('в блоке состояния видна обработанная свеча', $('engineBox').textContent.includes('Обработана свеча'));
   check('в блоке состояния виден сканер', $('engineBox').textContent.includes('Сигналов по истории'),

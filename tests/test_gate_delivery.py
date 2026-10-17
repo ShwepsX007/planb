@@ -185,6 +185,7 @@ async def test_runtime_reacts_to_candles_from_the_exchange(tmp_path, monkeypatch
 
     settings = BotSettings(symbol="BTC/USDT", market_type="futures", timeframe="1m",
                            data_source="gate", trade_mode="paper", candles_count=3,
+                           entry_mode="impulse",   # проверяем доставку, а не детектор
                            min_move_pct=0.5, fib_goal_pct=50.0, min_profit_pct=0.1,
                            base_volume_usd=10.0, max_positions=6, total_profit_target_usd=0.0,
                            poll_interval_sec=1.0, paper_balance_usd=1000.0,
@@ -281,11 +282,11 @@ def test_journal_explains_silence_once_per_settings():
 def test_scan_signals_counts_and_explains():
     """Сканер должен отвечать цифрами: сколько сигналов и какие были движения."""
     settings = BotSettings(timeframe="1m", candles_count=3, min_move_pct=0.6,
+                           entry_mode="impulse",   # здесь проверяется механика сканера
                            fib_goal_pct=50.0, min_profit_pct=0.1, direction="both")
 
-    # спокойный рынок: движения 0.02 % на свечу — порог 0.6 % недостижим
-    flat = impulse_candles(200, move_pct=0.02, end_ts=(now_ms() // MIN - 1) * MIN,
-                           direction="down" if True else "up")
+    # спокойный рынок: 0.02 % на свечу — порог 0.6 % недостижим
+    flat = impulse_candles(200, move_pct=0.02, end_ts=(now_ms() // MIN - 1) * MIN)
     flat = [Candle(ts=c.ts, open=c.open, high=c.open * 1.0001, low=c.open * 0.9999,
                    close=c.close, volume=1.0) for c in flat]
     scan_flat = scan_signals(flat, settings)
