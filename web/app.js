@@ -1087,6 +1087,7 @@ function renderBacktestResult(r) {
     info.innerHTML = d.count
       ? `${sourceLabel}: ${fmt(d.count, 0)} свечей, ${d.from_utc} → ${d.to_utc} UTC (${d.span_days} дн.)` +
         (d.months_in_period ? ` · месяцев в периоде: ${d.months_in_period}, скачано сейчас: ${d.months_downloaded}` : '') +
+        (d.tail_candles ? ` · последний месяц ещё не в архиве — догружено ${fmt(d.tail_candles, 0)} свечей через API` : '') +
         (d.gaps ? `, пропусков в данных: ${d.gaps}` : '') +
         (d.file ? ` · кеш <code>${escapeHtml(d.file)}</code>` : '')
       : '';
