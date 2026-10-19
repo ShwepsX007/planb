@@ -65,6 +65,33 @@ def open_cycle(engine, candles, price=None):
     return entry
 
 
+# ---------------------------------------------------------- intrabar execution
+def test_signal_can_open_before_the_live_candle_closes():
+    """The third bearish candle is still forming, but its % move already qualifies."""
+    candles = down_impulse()
+    engine = StrategyEngine(settings())
+    engine.set_history(candles[:-1])
+
+    action = engine.on_tick(candles[-1].close, candles[-1])
+
+    assert action and action[0].kind == "entry"
+    assert action[0].ref_price == pytest.approx(candles[-1].close)
+
+
+def test_average_add_can_trigger_on_a_price_tick_before_candle_close():
+    engine = StrategyEngine(settings(min_profit_pct=1.0))
+    candles = down_impulse()
+    open_cycle(engine, candles)
+
+    live = candle(candles[-1].ts + 300_000, 95.5, 95.5, 90.0, 90.0)
+    actions = engine.on_tick(90.0, live)
+
+    assert actions and actions[0].kind == "add"
+    assert actions[0].ref_price == pytest.approx(90.0)
+    assert engine.cycle.swing_low == pytest.approx(90.0)
+    assert engine.cycle.target == pytest.approx(95.1)
+
+
 # --------------------------------------------------------------------- basics
 def test_volume_schedule_defaults():
     assert settings().volume_schedule(6) == [10.0, 10.0, 20.0, 40.0, 80.0, 160.0]

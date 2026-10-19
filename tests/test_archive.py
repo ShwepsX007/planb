@@ -243,7 +243,9 @@ async def test_recent_tail_is_filled_from_api_when_the_month_is_not_published_ye
     tail_ts = (now // 300_000 - 1) * 300_000
     archive.tail = [Candle(ts=tail_ts, open=100, high=101, low=99, close=100.5, volume=1.0)]
 
-    start = now - 45 * 86_400_000
+    # Keep the fixture's two synthetic archive days inside the requested range;
+    # a fixed 45-day lookback can fall after those rows as the calendar advances.
+    start = ms(prev.year, prev.month)
     req = request(date_from=start, date_to=now)
     candles, info = await sync_archive(req)
     assert info["tail_candles"] == 1

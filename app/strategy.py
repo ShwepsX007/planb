@@ -2,9 +2,9 @@
 
 It is a pure, deterministic, exchange-agnostic state machine:
 
-    engine.on_candle(closed_candle) -> [Action, ...]
-    engine.on_tick(last_price)      -> [Action, ...]
-    engine.apply_fill(action, fill)   # result of an executed Action
+    engine.on_tick(last_price, live_candle) -> [Action, ...]
+    engine.on_candle(closed_candle)        -> [Action, ...]
+    engine.apply_fill(action, fill)        # result of an executed Action
 
 The exact same code is used live, in paper mode and by the backtester, which
 guarantees that a backtest reproduces what the bot does in production.
@@ -67,6 +67,11 @@ class StrategyEngine:
         self.last_candle_ts: int = 0
         self.candles_seen: int = 0
         self.closed_cycles: List[Cycle] = []
+        #: Последняя формирующаяся свеча, обновляемая по тикам. Она участвует
+        #: в детекторе сигналов, но не добавляется в историю закрытых свечей.
+        self._tick_candle: Optional[Candle] = None
+        #: Не открываем повторно тот же сигнал после закрытия цикла.
+        self._consumed_signals: set[tuple] = set()
 
     # ------------------------------------------------------------------ feeding
     def set_history(self, candles: Sequence[Candle]) -> None:
@@ -88,19 +93,81 @@ class StrategyEngine:
             self.last_price = candle.close
 
     # ------------------------------------------------------------------ events
-    def on_tick(self, price: float) -> List[Action]:
-        """Price update between candles - used to react to the target quickly."""
+    def on_tick(self, price: float, candle: Optional[Candle] = None) -> List[Action]:
+        """Обработать текущую цену, не ожидая закрытия таймфрейм-свечи.
+
+        ``candle`` — текущая формирующаяся OHLC-свеча фида. На каждом обновлении
+        цены стратегия обновляет экстремумы/цель, проверяет выходы и доливы, а
+        также проверяет сигнал на истории с заменённой формирующейся свечой.
+        """
         if price <= 0:
             return []
         self.last_price = price
-        if self.stopped or self.cycle is None:
+        live = self._live_candle(price, candle)
+        if self.stopped:
             return []
-        return self._exit_checks(self.cycle, high=price, low=price, open_price=price,
-                                 ts=now_ms(), close_price=price)
+
+        if self.cycle is None:
+            signal_candles = list(self.candles)
+            if signal_candles and signal_candles[-1].ts == live.ts:
+                signal_candles[-1] = live
+            elif not signal_candles or live.ts > signal_candles[-1].ts:
+                signal_candles.append(live)
+            impulse, reason = detect_signal(signal_candles, self.settings)
+            self.last_check = reason
+            if impulse is None:
+                return []
+            token = self._signal_token(impulse)
+            if token in self._consumed_signals:
+                return []
+            self._consumed_signals.add(token)
+            self.signals_found += 1
+            return [self._open_cycle(impulse, live, action_ts=now_ms())]
+
+        cycle = self.cycle
+        self._update_cycle_grid(cycle, price, live)
+        target_touched_in_profit = ((price >= cycle.target and price > cycle.avg_entry)
+                                    if cycle.side == "long" else
+                                    (price <= cycle.target and price < cycle.avg_entry))
+        actions = self._exit_checks(cycle, high=price, low=price, open_price=price,
+                                    ts=now_ms(), close_price=price)
+        if actions or target_touched_in_profit:
+            # Если цель уже затронута, но минимум профита ещё не набран, сохраняем
+            # сообщение _exit_checks и не подменяем его сообщением о готовом доливе.
+            return actions
+        return self._tick_add(cycle, price, now_ms())
+
+    def _live_candle(self, price: float, candle: Optional[Candle]) -> Candle:
+        """Вернуть актуальную формирующуюся свечу, не меняя закрытую историю."""
+        if candle is not None:
+            ts = int(candle.ts)
+            prev = self._tick_candle if self._tick_candle and self._tick_candle.ts == ts else None
+            live = Candle(ts=ts, open=float(candle.open),
+                          high=max(float(candle.high), price, prev.high if prev else price),
+                          low=min(float(candle.low), price, prev.low if prev else price),
+                          close=price, volume=float(candle.volume))
+        else:
+            from .config import TIMEFRAMES
+            width = int(TIMEFRAMES.get(self.settings.timeframe, 60) * 1000)
+            ts = now_ms() // width * width
+            prev = self._tick_candle if self._tick_candle and self._tick_candle.ts == ts else None
+            open_price = prev.open if prev else (self.candles[-1].close if self.candles else price)
+            live = Candle(ts=ts, open=open_price,
+                          high=max(price, prev.high if prev else price),
+                          low=min(price, prev.low if prev else price), close=price,
+                          volume=prev.volume if prev else 0.0)
+        self._tick_candle = live
+        return live
+
+    @staticmethod
+    def _signal_token(impulse) -> tuple:
+        return (impulse.side, impulse.move_side, impulse.start_ts, impulse.end_ts)
 
     def on_candle(self, candle: Candle) -> List[Action]:
-        """Process a single *closed* candle."""
+        """Process a single *closed* candle (the backtest path)."""
         self.push_candle(candle)
+        if self._tick_candle and self._tick_candle.ts <= candle.ts:
+            self._tick_candle = None
         if self.stopped:
             return []
 
@@ -109,14 +176,64 @@ class StrategyEngine:
             self.last_check = reason
             if impulse is None:
                 return []
-            self.last_check = reason
+            if self._signal_token(impulse) in self._consumed_signals:
+                return []
+            self._consumed_signals.add(self._signal_token(impulse))
             self.signals_found += 1
             return [self._open_cycle(impulse, candle)]
 
         return self._manage(self.cycle, candle)
 
     # ------------------------------------------------------------- cycle logic
-    def _open_cycle(self, impulse, candle: Candle) -> Action:
+    def _update_cycle_grid(self, cycle: Cycle, price: float,
+                           live: Optional[Candle] = None) -> None:
+        """Тянуть границы движения и пересчитывать фибо по каждому тиковому апдейту."""
+        s = self.settings
+        high = max(price, live.high if live else price)
+        low = min(price, live.low if live else price)
+        if cycle.side == "long":
+            cycle.swing_low = min(cycle.swing_low, low)
+            if s.update_swing_in_cycle:
+                cycle.swing_high = max(cycle.swing_high, high)
+        else:
+            cycle.swing_high = max(cycle.swing_high, high)
+            if s.update_swing_in_cycle:
+                cycle.swing_low = min(cycle.swing_low, low)
+        cycle.target = retrace_price(cycle.swing_low, cycle.swing_high,
+                                     cycle.move_side, cycle.goal_pct)
+
+    def _tick_add(self, cycle: Cycle, price: float, ts: int) -> List[Action]:
+        """Проверить условие долива на текущей цене, а не на закрытии свечи."""
+        s = self.settings
+        if not cycle.positions:
+            return []
+        if len(cycle.open_positions) >= s.max_positions:
+            self.last_check = f"лимит позиций {s.max_positions} достигнут"
+            return []
+        profit_pct = cycle.profit_pct_to(cycle.target)
+        new_extreme = (cycle.swing_low < cycle.extreme_at_last_entry if cycle.side == "long"
+                       else cycle.swing_high > cycle.extreme_at_last_entry)
+        guard_ok = (not s.require_new_extreme_for_add) or new_extreme
+        if profit_pct <= s.min_profit_pct + 1e-9 and guard_ok:
+            idx = len(cycle.positions) + 1
+            volume = s.volume_for_position(idx)
+            self.last_check = (f"долив #{idx} готов по текущей цене: профит до цели "
+                               f"{profit_pct:.3f}% <= {s.min_profit_pct:g}%")
+            return [Action(kind="add", side=cycle.side, ref_price=price,
+                           volume_usd=volume, position_idx=idx, target=cycle.target,
+                           reason=(f"профит до цели {profit_pct:.3f}% <= минимума "
+                                   f"{s.min_profit_pct:g}% (долив по текущей цене)"),
+                           ts=ts)]
+        if profit_pct <= s.min_profit_pct + 1e-9 and not guard_ok:
+            edge = "минимум" if cycle.side == "long" else "максимум"
+            self.last_check = (f"профит до цели {profit_pct:.2f}% <= {s.min_profit_pct:g}%, "
+                               f"нужен новый {edge} для долива #{len(cycle.positions) + 1}")
+        else:
+            self.last_check = (f"в позиции, профит до цели {profit_pct:.2f}% "
+                               f"(мин. {s.min_profit_pct:g}%)")
+        return []
+
+    def _open_cycle(self, impulse, candle: Candle, *, action_ts: Optional[int] = None) -> Action:
         s = self.settings
         cycle = Cycle(
             id=uuid.uuid4().hex[:12],
@@ -145,7 +262,7 @@ class StrategyEngine:
             position_idx=1,
             target=cycle.target,
             reason=f"сигнал: {impulse.candles} свечей {impulse.move_side} {impulse.move_pct:.2f}%",
-            ts=candle.ts,
+            ts=action_ts if action_ts is not None else candle.ts,
         )
 
     def _manage(self, cycle: Cycle, candle: Candle) -> List[Action]:
@@ -300,7 +417,7 @@ class StrategyEngine:
             if ready and (not s.require_new_extreme_for_add or new_extreme):
                 self.last_check = (f"долив #{nxt} готов: профит до цели {profit_pct:.2f}% "
                                    f"<= {s.min_profit_pct:g}%, экстремум обновлён — "
-                                   f"сработает на закрытии свечи")
+                                   f"исполняется по текущей цене")
                 return
             if ready:
                 edge = "минимум" if cycle.side == "long" else "максимум"

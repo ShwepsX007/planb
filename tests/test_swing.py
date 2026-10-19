@@ -101,6 +101,18 @@ def test_up_move_grid_is_inverted_in_the_chart_payload(tmp_path):
 
 
 # ------------------------------------------------- 2. движение определяется целиком
+def test_swing_signal_opens_on_a_forming_candle_without_waiting_for_close():
+    candles = down_leg_with_bounce(2.0)
+    engine = StrategyEngine(swing_settings())
+    engine.set_history(candles[:-1])
+
+    actions = engine.on_tick(candles[-1].close, candles[-1])
+
+    assert actions and actions[0].kind == "entry"
+    assert actions[0].side == "long"
+    assert actions[0].ref_price == pytest.approx(candles[-1].close)
+
+
 def test_swing_uses_the_whole_move_not_the_last_candles():
     """Сетка должна тянуться 90..100, а не по трём последним растущим свечам."""
     candles = down_leg_with_bounce(2.0)

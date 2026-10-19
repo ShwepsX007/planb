@@ -390,7 +390,10 @@ class BotRuntime:
                 if price > 0:
                     if isinstance(self.broker, PaperBroker):
                         await self.broker.set_price(price)
-                    actions = self.engine.on_tick(price)
+                    # Живая формирующаяся свеча нужна движку для входа по достигнутому
+                    # порогу и пересчёта сетки/доливов до закрытия таймфрейма.
+                    live_candle = getattr(self.feed, "live", None)
+                    actions = self.engine.on_tick(price, live_candle)
                     await self._execute(actions)
                 for candle in new_candles:
                     self._remember_candle(candle)

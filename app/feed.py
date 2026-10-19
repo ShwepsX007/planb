@@ -179,8 +179,17 @@ class GateFeed(BaseFeed):
         if not candles:
             return [], 0.0
         last_price = candles[-1].close
+        # OHLCV обычно содержит актуальный close формирующейся свечи, но тикер
+        # даёт более свежую последнюю сделку для внутрисвечных входов/доливов/выходов.
+        try:
+            ticker = await ex.fetch_ticker(self.unified)
+            tick_price = float(ticker.get("last") or ticker.get("close") or 0.0)
+            if tick_price > 0:
+                last_price = tick_price
+        except Exception:
+            pass  # сохраняем работоспособность, если endpoint тикера временно недоступен
 
-        # формирующаяся свеча — только для графика; стратегии её отдавать нельзя
+        # Формирующаяся свеча используется стратегией для intrabar signal detection.
         self.live = None if self._is_closed(candles[-1]) else candles[-1]
 
         new: List[Candle] = []
