@@ -70,6 +70,7 @@ CREATE TABLE IF NOT EXISTS backtests (
     result TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_positions_cycle ON positions(cycle_id);
+CREATE INDEX IF NOT EXISTS idx_cycles_closed_ts ON cycles(closed_ts);
 CREATE INDEX IF NOT EXISTS idx_logs_ts ON logs(ts);
 """
 
@@ -174,6 +175,23 @@ class Database:
                 "SELECT * FROM cycles ORDER BY COALESCE(closed_ts, opened_ts) DESC LIMIT ?",
                 (limit,)).fetchall()
         return [dict(r) for r in rows]
+
+    def cycle_stats_since(self, since_ts: int) -> Dict[str, Any]:
+        """Aggregate closed-cycle results from an inclusive timestamp."""
+        with self._lock:
+            row = self.conn.execute(
+                """SELECT COUNT(*) AS cycles,
+                          SUM(CASE WHEN pnl >= 0 THEN 1 ELSE 0 END) AS wins,
+                          SUM(CASE WHEN pnl < 0 THEN 1 ELSE 0 END) AS losses,
+                          COALESCE(SUM(pnl), 0) AS pnl
+                   FROM cycles WHERE status='closed' AND closed_ts >= ?""",
+                (int(since_ts),)).fetchone()
+        cycles = int(row["cycles"] or 0)
+        wins = int(row["wins"] or 0)
+        losses = int(row["losses"] or 0)
+        pnl = float(row["pnl"] or 0.0)
+        return {"cycles": cycles, "wins": wins, "losses": losses, "pnl": pnl,
+                "win_rate": round(wins / cycles * 100.0, 2) if cycles else 0.0}
 
     def all_positions(self, limit: int = 500) -> List[Dict[str, Any]]:
         with self._lock:

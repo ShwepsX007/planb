@@ -90,6 +90,9 @@ async def test_candles_backtest_and_bot_lifecycle(client: httpx.AsyncClient):
     assert resumed in ("running", "paused")
     assert (await client.post("/api/bot/stop")).json()["status"] == "stopped"
     assert (await client.post("/api/bot/reset-stats")).json()["ok"] is True
+    assert (await client.post("/api/bot/reset-daily-stats")).json()["ok"] is True
+    state_after_reset = (await client.get("/api/state")).json()
+    assert state_after_reset["stats_24h"]["cycles"] == 0
 
     assert (await client.get("/api/logs?limit=50")).json()["logs"]
     assert (await client.get("/api/cycles")).json()["ok"] is True

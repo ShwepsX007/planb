@@ -11,11 +11,11 @@ guarantees that a backtest reproduces what the bot does in production.
 
 Algorithm (long side; the short side is the mirror image)
 ---------------------------------------------------------
-1. Signal: `candles_count` candles in one direction (for a long: bearish
-   candles) whose high-low range >= `min_move_pct`.
-   The swing is `swing_high` = max high, `swing_low` = min low of those candles
-   and the fibonacci grid is stretched from `swing_low` (0%) to `swing_high`
-   (100%).
+1. Signal in the default `swing` mode: detect a complete leg between price
+   extrema using `min_move_pct`; the number of candles is measured automatically,
+   not configured. The old `impulse` mode alone requires `candles_count` candles
+   in one direction. For a long, the swing is `swing_high` = prior high and
+   `swing_low` = last low; the grid spans the complete move.
 2. Entry #1 at the market on the close of the last impulse candle, provided the
    distance from the entry to the fib target (`fib_goal_pct`, e.g. 50%) is at
    least `min_profit_pct`.
@@ -680,11 +680,14 @@ def scan_signals(candles: Sequence[Candle], settings, *, sample: int = 5) -> Dic
     Нужен, чтобы честно ответить на вопрос «почему бот молчит»: показывает размер
     движений в окне настроек против порога и самые близкие к входу случаи.
     """
-    n = int(settings.candles_count)
+    automatic_swing = str(getattr(settings, "entry_mode", "swing") or "swing").lower() != "impulse"
+    # For swing diagnostics use a stable 3-candle sample only to describe local
+    # volatility; it is not a trading gate. Impulse mode analyzes its configured N.
+    n = 3 if automatic_swing else int(settings.candles_count)
     total = len(candles)
     if total <= n:
         return {"candles": total, "windows": 0, "signals": 0, "enough_data": False,
-                "reason": f"мало свечей: {total} из {n}"}
+                "reason": f"мало свечей для сканера: {total} из {n}"}
 
     moves: List[float] = []
     signals: List[Dict[str, Any]] = []
@@ -741,7 +744,9 @@ def scan_signals(candles: Sequence[Candle], settings, *, sample: int = 5) -> Dic
         "move_median_pct": round(median, 3),
         "move_p90_pct": round(quantile(0.9), 3),
         "move_max_pct": round(max_move, 3),
-        "candles_count": n,
+        "candles_count": None if automatic_swing else n,
+        "window_candles": n,
+        "auto_count": automatic_swing,
         "timeframe": settings.timeframe,
         "symbol": settings.symbol,
         "minutes": tf_min,

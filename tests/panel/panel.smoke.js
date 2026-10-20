@@ -57,6 +57,7 @@ const snapshot = {
   started_at: Date.now() - 60000, last_loop_ts: Date.now(), loop_count: 42,
   price: 59500.5, balance: { mode: 'paper', total: 1005.25, free: 1005.25, used: 160, start_balance: 1000 },
   exchange_position: 0, grid: null, target_total_profit: 50,
+  stats_24h: { pnl: 1.25, cycles: 2, wins: 1, losses: 1, reset_at: null, window_hours: 24 },
   pending_orders: [{ role: 'add', idx: 4, price: 58800, volume_usd: 40, qty: 0.00068, status: 'open' }],
   total_progress_pct: 10.5, volume_schedule: [10, 10, 20, 40, 80, 160], updated_at: Date.now(),
   engine: {
@@ -221,10 +222,26 @@ setTimeout(async () => {
   check('форма бэктеста построена', window.document.querySelectorAll('#btForm .field').length > 10);
   check('в настройках есть выбор метода входа', !!$('set_entry_mode') && $('set_entry_mode').value === 'swing',
     $('set_entry_mode') ? $('set_entry_mode').value : 'нет поля');
+  check('фиксированное N скрыто в автоматическом swing-режиме',
+    $('set_candles_count').closest('.field').classList.contains('hidden'));
+  $('set_entry_mode').value = 'impulse';
+  $('set_entry_mode').dispatchEvent(new window.Event('change'));
+  check('фиксированное N доступно в старом impulse-режиме',
+    !$('set_candles_count').closest('.field').classList.contains('hidden'));
+  $('set_entry_mode').value = 'swing';
+  $('set_entry_mode').dispatchEvent(new window.Event('change'));
   check('в настройках есть минимальная коррекция', !!$('set_min_correction_pct'));
   check('подсказка цели знает, где 0 сетки',
     $('cTargetHint').textContent.includes('0 снизу'), $('cTargetHint').textContent);
   check('в бэктесте можно выбрать метод входа', !!$('bt_entry_mode') && $('bt_entry_mode').value === 'swing');
+  check('в бэктесте фиксированное N скрыто для swing',
+    $('bt_candles_count').closest('.field').classList.contains('hidden'));
+  $('bt_entry_mode').value = 'impulse';
+  $('bt_entry_mode').dispatchEvent(new window.Event('change'));
+  check('в бэктесте N доступно для старого impulse-метода',
+    !$('bt_candles_count').closest('.field').classList.contains('hidden'));
+  $('bt_entry_mode').value = 'swing';
+  $('bt_entry_mode').dispatchEvent(new window.Event('change'));
   check('в бэктесте есть выбор источника данных',
     !!$('bt_data_mode') && $('bt_data_mode').value === 'archive', $('bt_data_mode').value);
   check('для архива скрыт лимит свечей и виден период',
@@ -257,13 +274,15 @@ setTimeout(async () => {
   $('bt_data_mode').dispatchEvent(new window.Event('change'));
   $('bt_archive_period').value = '2';
   $('bt_archive_period').dispatchEvent(new window.Event('change'));
-  check('логика объясняет движение целиком',
-    $('lgMode').textContent.includes('движение целиком') && $('lgLookback').textContent.trim() === '120',
+  check('логика объясняет автоматический поиск swing без фиксированного N',
+    $('lgMode').textContent.includes('автоматически') && $('lgLookback').textContent.trim() === '120',
     $('lgMode').textContent);
   check('статус в шапке', text('statusBadge') === 'работает', text('statusBadge'));
   check('режим LIVE', text('modeBadge') === 'LIVE', text('modeBadge'));
   check('пара', text('pairInfo').includes('BTC/USDT'), text('pairInfo'));
   check('общий профит', text('cPnl').includes('5.2500'), text('cPnl'));
+  check('статистика за сутки отображает P/L и циклы', text('cDailyPnl').includes('1.2500')
+    && text('cDailySummary').includes('циклов 2'), `${text('cDailyPnl')} · ${text('cDailySummary')}`);
   check('средняя входа', text('cAvg').replace(/\s/g, '').startsWith('59'), text('cAvg'));
   check('цель', text('cTarget').replace(/\s/g, '').startsWith('59'), text('cTarget'));
   check('профит до цели', text('cProfitToTarget').includes('0.508'), text('cProfitToTarget'));
@@ -366,6 +385,14 @@ setTimeout(async () => {
   check('стартовый экран скрывается после загрузки',
     $('boot') && $('boot').classList.contains('hidden'),
     $('boot') ? 'классы: ' + $('boot').className : 'нет элемента #boot');
+  $('btnResetDailyStats').click();
+  await new Promise((r) => setTimeout(r, 50));
+  check('кнопка сброса суток вызывает отдельный endpoint',
+    calls.some((c) => c.includes('/api/bot/reset-daily-stats')));
+  $('btnResetAllStats').click();
+  await new Promise((r) => setTimeout(r, 50));
+  check('кнопка сброса общей статистики вызывает endpoint',
+    calls.some((c) => c.includes('/api/bot/reset-stats')));
   // «бот молчит»: свечи идут, входов нет — панель обязана объяснить причину цифрами
   const silent = JSON.parse(JSON.stringify(snapshot));
   silent.engine.cycle = null;

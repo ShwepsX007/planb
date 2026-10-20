@@ -66,7 +66,8 @@
     <div class="overview-heading"><h2>Состояние бота и позиции</h2><span class="muted">Обзор обновляется вместе с графиком</span></div>
     <div id="stateHint" class="hint-banner hidden"></div>
     <div class="cards">
-      <div class="card"><div class="card-label">Общий профит</div>
+      <div class="card"><div class="card-title-row"><div class="card-label">Общий профит</div>
+        <button class="btn btn-small card-reset" id="btnResetAllStats" title="Сбросить общие счётчики, не удаляя историю">Сброс</button></div>
         <div class="card-value" id="cPnl">0.00 $</div>
         <div class="progress"><div class="progress-bar" id="cProgressBar"></div></div>
         <div class="card-hint" id="cProgressText">цель: —</div>
@@ -90,6 +91,12 @@
       <div class="card"><div class="card-label">Циклы</div>
         <div class="card-value" id="cCycles">0</div>
         <div class="card-hint" id="cCyclesHint">прибыльных 0 · убыточных 0</div>
+      </div>
+      <div class="card"><div class="card-title-row"><div class="card-label">Профит за сутки</div>
+        <button class="btn btn-small card-reset" id="btnResetDailyStats" title="Начать новый 24-часовой период статистики">Сброс</button></div>
+        <div class="card-value" id="cDailyPnl">0,0000 $</div>
+        <div class="card-hint" id="cDailySummary">циклов 0 · прибыльных 0 · убыточных 0</div>
+        <div class="card-hint" id="cDailyWindow">последние 24 часа</div>
       </div>
       <div class="card"><div class="card-label">Баланс</div>
         <div class="card-value" id="cBalance">—</div>
@@ -139,9 +146,9 @@
       <h2>Логика расчёта</h2>
       <div class="legend">
         <p><b>1.</b> Бот ищет <b>движение целиком</b>: <span id="lgMode">—</span>.
-        Окно поиска — <span id="lgLookback">—</span> свечей таймфрейма <span id="lgTf">5m</span>,
-        движение должно быть не меньше <span id="lgMove">—</span>%. В старом режиме — минимум
-        <span id="lgCandles">3</span> свечей в одну сторону.</p>
+        Окно анализа — до <span id="lgLookback">—</span> свечей таймфрейма <span id="lgTf">5m</span>,
+        движение должно быть не меньше <span id="lgMove">—</span>%. В swing число свечей считается автоматически;
+        фиксированное N (<span id="lgCandles">3</span>) нужно только для старого impulse-режима.</p>
         <p><b>2.</b> Растягивает сетку Фибоначчи по всему движению: <b>0% — конец движения</b>
         (последний минимум при падении, последний максимум при росте), <b>100% — его начало</b>
         (предыдущий противоположный экстремум). Для падения 0 внизу, для роста — 0 вверху.

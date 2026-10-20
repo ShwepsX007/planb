@@ -126,6 +126,12 @@ def test_swing_uses_the_whole_move_not_the_last_candles():
     assert impulse.candles >= 10, "движение целиком, а не последние 3 свечи"
     assert 5 < impulse.correction_pct < 50
 
+    # Swing itself has no fixed N-candle gate: even a legacy value above the
+    # actual leg's duration must not suppress the auto-detected signal.
+    auto_count, auto_reason = detect_swing(candles, swing_settings(candles_count=50))
+    assert auto_count is not None, auto_reason
+    assert auto_count.candles == impulse.candles
+
     # для сравнения: старый метод видит только последние 3 растущие свечи
     old, old_reason = detect_impulse(candles, swing_settings(entry_mode="impulse",
                                                              min_move_pct=0.1,

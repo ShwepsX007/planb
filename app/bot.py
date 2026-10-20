@@ -31,6 +31,7 @@ STATUS_RUNNING = "running"
 STATUS_PAUSED = "paused"
 STATUS_TARGET = "target_reached"
 STATUS_LOSS = "stopped_by_stop_loss"
+DAY_MS = 24 * 60 * 60 * 1000
 STATUS_ERROR = "error"
 
 
@@ -204,10 +205,13 @@ class BotRuntime:
                 self._task = asyncio.create_task(self._run_loop())
                 mode = "LIVE" if self.settings.trade_mode == "live" else "PAPER"
                 money_label = ("РЕАЛЬНЫЕ ДЕНЬГИ" if mode == "LIVE" else "виртуальные сделки")
+                movement_label = (f"автопоиск движения ≥ {self.settings.min_move_pct:g}%"
+                                  if self.settings.entry_mode == "swing"
+                                  else f"импульс {self.settings.candles_count} свечей, "
+                                       f"мин. движение {self.settings.min_move_pct:g}%")
                 self.log("info", f"Бот запущен ({mode} — {money_label}, "
                                  f"{self.settings.data_source_label()}, {self.settings.symbol}, "
-                                 f"{self.settings.timeframe}, свечей {self.settings.candles_count}, "
-                                 f"мин. движение {self.settings.min_move_pct:g}%, "
+                                 f"{self.settings.timeframe}, {movement_label}, "
                                  f"цель фибо {self.settings.fib_goal_pct:g}%, "
                                  f"мин. профит {self.settings.min_profit_pct:g}%)")
                 if self.engine.cycle:
@@ -365,6 +369,7 @@ class BotRuntime:
         return {"ok": True, "price": price, "pnl": closed.pnl}
 
     async def reset_stats(self) -> Dict[str, Any]:
+        """Reset all-time counters without deleting the detailed trade history."""
         self.engine.realized_pnl = 0.0
         self.engine.cycles_total = 0
         self.engine.wins = 0
@@ -372,9 +377,26 @@ class BotRuntime:
         self.engine.signals_found = 0
         self.engine.closed_cycles = []
         self.engine.resume()
+        self.db.kv_set("stats_reset_ts", now_ms())
         self._persist_state()
-        self.log("info", "Статистика и счётчик общего профита сброшены")
+        self.log("info", "Общая статистика сброшена; история циклов и сделок сохранена")
+        self.broadcast({"type": "snapshot", "snapshot": self.snapshot()})
         return {"ok": True}
+
+    async def reset_daily_stats(self) -> Dict[str, Any]:
+        """Start a fresh rolling 24-hour statistics window; history is retained."""
+        reset_ts = now_ms()
+        self.db.kv_set("daily_stats_reset_ts", reset_ts)
+        self.log("info", "Статистика за сутки сброшена; история циклов и сделок сохранена")
+        self.broadcast({"type": "snapshot", "snapshot": self.snapshot()})
+        return {"ok": True, "reset_ts": reset_ts}
+
+    def _daily_stats(self) -> Dict[str, Any]:
+        now = now_ms()
+        reset_ts = int(self.db.kv_get("daily_stats_reset_ts", 0) or 0)
+        since_ts = max(now - DAY_MS, reset_ts)
+        return {**self.db.cycle_stats_since(since_ts), "since_ts": since_ts,
+                "reset_at": reset_ts or None, "window_hours": 24}
 
     async def apply_settings(self, new_settings: BotSettings) -> Dict[str, Any]:
         """Save settings; if the bot runs - restart so they take effect."""
@@ -414,9 +436,11 @@ class BotRuntime:
                             if was_running and connection_changed else ""))
         if was_running and not connection_changed:
             # пороги, объём и цели движок читает на каждом тике: перезапуск не нужен
-            self.log("info", f"Новые пороги применены без перезапуска: мин. движение "
-                             f"{new_settings.min_move_pct:g}%, мин. профит "
-                             f"{new_settings.min_profit_pct:g}%, свечей {new_settings.candles_count}")
+            movement_label = ("автоматическое число свечей" if new_settings.entry_mode == "swing"
+                              else f"{new_settings.candles_count} свечей в импульсе")
+            self.log("info", f"Новые параметры применены без перезапуска: {movement_label}, "
+                             f"мин. движение {new_settings.min_move_pct:g}%, мин. профит "
+                             f"{new_settings.min_profit_pct:g}%")
         if was_running and connection_changed:
             await self.start(new_settings, restart=True)
             if market_changed and self.engine.cycle is not None:
@@ -522,7 +546,8 @@ class BotRuntime:
         """
         try:
             candles = self._chart_candles
-            if len(candles) <= self.settings.candles_count:
+            scan_window = 3 if self.settings.entry_mode == "swing" else self.settings.candles_count
+            if len(candles) <= scan_window:
                 return
             scan = scan_signals(candles, self.settings)
             scan["updated_at"] = now_ms()
@@ -539,7 +564,8 @@ class BotRuntime:
         """
         if not scan.get("enough_data") or scan.get("error"):
             return
-        key = (f"{self.settings.data_source}|{self.settings.timeframe}|{self.settings.candles_count}|"
+        count_key = (self.settings.candles_count if self.settings.entry_mode == "impulse" else "auto")
+        key = (f"{self.settings.data_source}|{self.settings.timeframe}|{self.settings.entry_mode}|{count_key}|"
                f"{self.settings.min_move_pct}|{self.settings.min_profit_pct}|{self.settings.direction}")
         if scan.get("signals"):
             self._silence_warned_for = ""      # сигналы снова есть — предупредим при новой тишине
@@ -943,6 +969,7 @@ class BotRuntime:
             "balance": self.balance,
             "exchange_position": self.exchange_position,
             "engine": engine_state,
+            "stats_24h": self._daily_stats(),
             "grid": grid,
             "pending_orders": [
                 {"role": role, **order} for role, order in self._managed_orders.items() if order

@@ -44,7 +44,8 @@ class BotSettings(BaseModel):
 
     # ------------------------------------------------------------------ strategy
     entry_mode: Literal["swing", "impulse"] = "swing"
-    candles_count: int = Field(default=3, ge=1, le=50, description="свечей в одну сторону")
+    candles_count: int = Field(default=3, ge=1, le=50,
+                               description="число свечей только для legacy impulse-метода")
     swing_lookback: int = Field(default=120, ge=10, le=500,
                                 description="сколько свечей просматривать при поиске движения")
     swing_fresh_candles: int = Field(default=24, ge=2, le=200,
@@ -142,7 +143,7 @@ class BotSettings(BaseModel):
     def _check_positions(self) -> "BotSettings":
         if self.multiplier_start_position > self.max_positions:
             self.multiplier_start_position = self.max_positions
-        if self.swing_lookback < self.candles_count * 2:
+        if self.entry_mode == "impulse" and self.swing_lookback < self.candles_count * 2:
             self.swing_lookback = self.candles_count * 2
         if self.market_type == "spot" and self.direction == "short":
             self.direction = "long"

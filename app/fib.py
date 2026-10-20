@@ -278,17 +278,22 @@ def detect_swing(candles: Sequence[Candle], settings) -> Tuple[Optional[Impulse]
         падение: 1 = предыдущий максимум, 0 = последний минимум  (0 внизу);
         рост:    1 = предыдущий минимум,   0 = последний максимум (0 вверху).
 
-    Сигнал появляется, когда движение закончилось (экстремум свежий) и началась
-    коррекция: цена отошла от экстремума, но ещё не дошла до цели. Поэтому сетка
-    строится по реальному размаху рынка, а не по трём последним свечам.
+    Число свечей не задаётся заранее: начало и конец ноги выбираются по экстремумам,
+    а длительность лишь записывается в сигнал. Сигнал появляется, когда движение
+    достигло минимального процента, экстремум свежий и началась коррекция: цена
+    отошла от экстремума, но ещё не дошла до цели. Поэтому сетка строится по
+    реальному размаху рынка, а не по фиксированному числу последних свечей.
     """
     lookback = int(getattr(settings, "swing_lookback", 120) or 120)
     fresh = int(getattr(settings, "swing_fresh_candles", 24) or 24)
-    min_candles = max(2, int(getattr(settings, "candles_count", 3) or 3))
-    if len(candles) < min_candles + 1:
-        return None, f"мало свечей ({len(candles)}/{min_candles + 1})"
+    # Swing mode needs only enough data to establish two price points. The
+    # movement's actual candle count is measured from its detected pivots; the
+    # legacy candles_count setting applies only to impulse mode.
+    min_data_candles = 2
+    if len(candles) < min_data_candles:
+        return None, f"мало свечей ({len(candles)}/{min_data_candles})"
 
-    window: List[Candle] = list(candles[-max(lookback, min_candles + 1):])
+    window: List[Candle] = list(candles[-max(lookback, min_data_candles):])
     m = len(window)
     thr = max(0.01, float(settings.min_move_pct))
     pivots, current = _zigzag(window, thr)
@@ -299,8 +304,6 @@ def detect_swing(candles: Sequence[Candle], settings) -> Tuple[Optional[Impulse]
 
     start_i, end_i = start[0], end[0]
     leg_candles = end_i - start_i + 1
-    if leg_candles < min_candles:
-        return None, f"движение короче {min_candles} свечей ({leg_candles})"
 
     leg_candles_slice = window[start_i:end_i + 1]
     high = max(c.high for c in leg_candles_slice)

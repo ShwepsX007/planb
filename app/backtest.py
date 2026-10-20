@@ -28,7 +28,7 @@ def run_backtest(candles: Sequence[Candle], settings: BotSettings, *,
         return {"error": "нет свечей"}
     balance = float(initial_balance if initial_balance is not None else settings.paper_balance_usd)
     engine = StrategyEngine(settings)
-    warmup = max(settings.candles_count, 5)
+    warmup = max(settings.candles_count if settings.entry_mode == "impulse" else 2, 5)
 
     equity_curve: List[Dict[str, float]] = []
     trades: List[Dict[str, Any]] = []

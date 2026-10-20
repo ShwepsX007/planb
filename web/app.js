@@ -152,6 +152,12 @@ function renderSnapshot(s) {
   $('cCycles').textContent = e.cycles_total ?? 0;
   $('cCyclesHint').textContent = `прибыльных ${e.wins ?? 0} · убыточных ${e.losses ?? 0} · сигналов ${e.signals_found ?? 0}`;
 
+  const day = s.stats_24h || {};
+  $('cDailyPnl').textContent = money(day.pnl ?? 0, 4);
+  $('cDailyPnl').className = 'card-value ' + cls(day.pnl ?? 0);
+  $('cDailySummary').textContent = `циклов ${day.cycles ?? 0} · прибыльных ${day.wins ?? 0} · убыточных ${day.losses ?? 0}`;
+  $('cDailyWindow').textContent = day.reset_at ? 'с последнего сброса · не более 24 ч' : 'скользящие последние 24 часа';
+
   const b = s.balance || {};
   $('cBalance').textContent = b.total !== undefined ? fmt(b.total, 2) + ' $' : '—';
   $('cBalanceHint').textContent = b.mode === 'paper' ? `виртуальный (старт ${fmt(b.start_balance, 2)} $)` :
@@ -387,7 +393,7 @@ function renderLogic(s) {
   const modeEl = $('lgMode');
   if (modeEl) {
     modeEl.textContent = swing
-      ? 'движение целиком: от предыдущего максимума до последнего минимума (или наоборот)'
+      ? 'экстремумы движения определяются автоматически; фиксированного числа свечей нет'
       : `N свечей в одну сторону (${st.candles_count ?? '—'} шт.)`;
   }
   $('lgCandles').textContent = st.candles_count ?? '—';
@@ -646,16 +652,17 @@ const FIELDS = [
   { group: 'Данные и сигнал', fields: [
     { k: 'timeframe', l: 'Таймфрейм', t: 'tf' },
     { k: 'entry_mode', l: 'Метод поиска движения', t: 'select',
-      o: [['swing', 'Движение целиком (сетка по всему ходу цены)'],
-          ['impulse', 'N свечей в одну сторону (старый метод)']],
-      h: 'swing: сетка тянется от предыдущего максимума до последнего минимума (и наоборот), вход на коррекции' },
-    { k: 'swing_lookback', l: 'Окно поиска движения, свечей', t: 'number', step: 10, min: 10, max: 500, int: true,
-      h: 'сколько свечей назад искать начало движения (swing)' },
-    { k: 'swing_fresh_candles', l: 'Экстремум не старше, свечей', t: 'number', step: 1, min: 2, max: 200, int: true,
-      h: 'движение считается свежим, если его минимум/максимум был не раньше (swing)' },
+      o: [['swing', 'Автоматически по движению (без фиксированного N свечей)'],
+          ['impulse', 'Фиксированное N свечей в одну сторону (старый метод)']],
+      h: 'swing сам находит экстремумы, проверяет минимальный % движения и ждёт коррекцию до цели Фибо' },
+    { k: 'swing_lookback', l: 'Макс. окно поиска, свечей', t: 'number', step: 10, min: 10, max: 500, int: true,
+      h: 'максимальная глубина истории для поиска начала движения; фактическое число свечей определяется по экстремумам' },
+    { k: 'swing_fresh_candles', l: 'Макс. возраст экстремума, свечей', t: 'number', step: 1, min: 2, max: 200, int: true,
+      h: 'не входить, если последний максимум/минимум движения старше этого значения' },
     { k: 'min_correction_pct', l: 'Мин. коррекция для входа, % сетки', t: 'number', step: 1, min: 0, max: 95,
       h: 'вход только когда цена отошла от экстремума (0 — входить у экстремума, как раньше)' },
-    { k: 'candles_count', l: 'Свечей в одну сторону / минимум в движении', t: 'number', step: 1, min: 1, max: 50, int: true },
+    { k: 'candles_count', l: 'N свечей (старый impulse-метод)', t: 'number', step: 1, min: 1, max: 50, int: true,
+      h: 'Используется только в режиме «Фиксированное N свечей»; в автоматическом swing-режиме игнорируется.' },
     { k: 'min_move_pct', l: 'Минимальное движение цены, %', t: 'number', step: 0.1, min: 0.01 },
     { k: 'fib_goal_pct', l: 'Цель: уровень коррекции по Фибо, %', t: 'number', step: 1, min: 1, h: '50 % — середина сетки' },
     { k: 'min_profit_pct', l: 'Минимальный профит, %', t: 'number', step: 0.05, min: 0.01 },
@@ -697,6 +704,13 @@ function renderSettingsForm(settings) {
   const host = $('settingsForm');
   host.innerHTML = FIELDS.map((g) => `<div class="settings-group"><h3>${g.group}</h3>
     <div class="fields-grid">${g.fields.map((f) => fieldHtml(f, settings[f.k])).join('')}</div></div>`).join('');
+  const mode = $('set_entry_mode');
+  const countField = $('set_candles_count')?.closest('.field');
+  const syncEntryMode = () => {
+    if (countField) countField.classList.toggle('hidden', mode.value !== 'impulse');
+  };
+  if (mode) mode.onchange = syncEntryMode;
+  if (mode && countField) syncEntryMode();
 }
 
 function fieldHtml(f, value) {
@@ -746,11 +760,11 @@ let btTimer = null;
 
 const BT_STRATEGY_FIELDS = [
   ['entry_mode', 'Метод входа', 'select',
-    [['swing', 'Движение целиком (сетка по всему ходу)'], ['impulse', 'N свечей в одну сторону']]],
-  ['swing_lookback', 'Окно поиска движения, свечей', 'number'],
-  ['swing_fresh_candles', 'Экстремум не старше, свечей', 'number'],
+    [['swing', 'Автоматически по движению (без фиксированного N)'], ['impulse', 'Фиксированное N свечей (старый метод)']]],
+  ['swing_lookback', 'Макс. окно поиска движения, свечей', 'number'],
+  ['swing_fresh_candles', 'Макс. возраст экстремума, свечей', 'number'],
   ['min_correction_pct', 'Мин. коррекция для входа, %', 'number'],
-  ['candles_count', 'Свечей в одну сторону', 'number'],
+  ['candles_count', 'N свечей (только старый impulse)', 'number'],
   ['min_move_pct', 'Мин. движение, %', 'number'],
   ['fib_goal_pct', 'Цель по Фибо, %', 'number'],
   ['min_profit_pct', 'Мин. профит, %', 'number'],
@@ -796,21 +810,29 @@ function renderBacktestForm(settings) {
     const id = `bt_${k}`;
     const value = defs[k] !== undefined ? defs[k]
       : (st[k] !== undefined && st[k] !== null ? st[k] : '');
+    const fieldClass = k === 'candles_count' ? 'field bt-legacy-candles' : 'field';
     if (t === 'select') {
-      return `<div class="field"><label>${l}</label><select id="${id}">` +
+      return `<div class="${fieldClass}"><label>${l}</label><select id="${id}">` +
         o.map(([v, txt]) => `<option value="${v}" ${value === v ? 'selected' : ''}>${txt}</option>`).join('') +
         '</select></div>';
     }
     if (t === 'tf') {
       const tfs = st.timeframes || ['1m', '5m', '15m', '1h', '4h', '1d'];
-      return `<div class="field"><label>${l}</label><select id="${id}">` +
+      return `<div class="${fieldClass}"><label>${l}</label><select id="${id}">` +
         tfs.map((v) => `<option value="${v}" ${value === v ? 'selected' : ''}>${v}</option>`).join('') +
         '</select></div>';
     }
-    return `<div class="field"><label>${l}</label>` +
+    return `<div class="${fieldClass}"><label>${l}</label>` +
       `<input type="${t}" step="any" id="${id}" value="${value}" autocomplete="off"></div>`;
   }).join('');
   $('btForm').innerHTML = html(head) + html(BT_STRATEGY_FIELDS);
+  const entryMode = $('bt_entry_mode');
+  const legacyCandles = $('bt_candles_count')?.closest('.field');
+  const syncBtEntryMode = () => {
+    if (legacyCandles) legacyCandles.classList.toggle('hidden', entryMode.value !== 'impulse');
+  };
+  if (entryMode) entryMode.onchange = syncBtEntryMode;
+  if (entryMode && legacyCandles) syncBtEntryMode();
   const mode = $('bt_period_mode');
   if (mode) mode.onchange = syncBtPeriod;
   const dataMode = $('bt_data_mode');
@@ -1276,6 +1298,25 @@ async function botAction(path, label) {
   } catch (e) { toast(label + ': ' + e.message, 'err'); }
 }
 
+async function resetStatistics(scope) {
+  const allTime = scope === 'all';
+  const label = allTime ? 'Общую статистику' : 'Статистику за сутки';
+  const message = allTime
+    ? 'Сбросить общие счётчики профита и циклов? Открытый цикл не закроется, история сделок останется в журнале.'
+    : 'Начать новый 24-часовой период статистики? История циклов и сделок не удаляется.';
+  if (!confirm(message)) return;
+  try {
+    const path = allTime ? '/api/bot/reset-stats' : '/api/bot/reset-daily-stats';
+    const result = await api('POST', path);
+    if (!result || result.ok === false) throw new Error((result && result.error) || 'сброс не выполнен');
+    app.snapshot = await api('GET', '/api/state');
+    renderSnapshot(app.snapshot);
+    toast(`${label} сброшена; история сохранена`);
+  } catch (e) {
+    toast(`${label}: ${e.message}`, 'err');
+  }
+}
+
 /* --------------------------------------------------------------------- init */
 function switchTab(name) {
   document.querySelectorAll('.tab').forEach((t) => t.classList.toggle('active', t.dataset.tab === name));
@@ -1328,6 +1369,8 @@ function bootFail(error) {
 async function init() {
   document.querySelectorAll('.tab').forEach((t) => t.addEventListener('click', () => switchTab(t.dataset.tab)));
   $('btnStart').onclick = () => botAction('/api/bot/start', 'Старт');
+  $('btnResetAllStats').onclick = () => resetStatistics('all');
+  $('btnResetDailyStats').onclick = () => resetStatistics('daily');
   $('btnPause').onclick = () => {
     const paused = app.snapshot && app.snapshot.paused;
     botAction(paused ? '/api/bot/resume' : '/api/bot/pause', paused ? 'Продолжение' : 'Пауза');

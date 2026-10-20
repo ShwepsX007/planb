@@ -65,6 +65,9 @@ main{padding:16px 18px 60px;max-width:1600px;margin:0 auto}
 .cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:12px;margin-bottom:16px}
 .card{background:var(--bg2);border:1px solid var(--line);border-radius:var(--radius);padding:12px 14px}
 .card-label{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px}
+.card-title-row{display:flex;align-items:center;justify-content:space-between;gap:6px;margin-bottom:6px}
+.card-title-row .card-label{margin:0}
+.card-reset{padding:3px 7px;font-size:10px;flex-shrink:0}
 .card-value{font-size:20px;font-weight:600;font-variant-numeric:tabular-nums}
 .card-hint{font-size:11px;color:var(--muted);margin-top:6px}
 .pos{color:var(--green)} .neg{color:var(--red)} .neutral{color:var(--text)}
