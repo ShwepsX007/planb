@@ -73,6 +73,45 @@ async def test_paper_take_profit_fills_on_wick_even_when_price_returns_below_tar
 
 
 @pytest.mark.asyncio
+async def test_paper_tp_ignores_same_candle_wick_that_happened_before_order_submission():
+    settings = BotSettings(trade_mode="paper", fee_pct=0.0, slippage_pct=0.0)
+    broker = PaperBroker(settings)
+    await broker.open_position("long", 10.0, 100.0)
+    candle = Candle(ts=10, open=101, high=106, low=100, close=101, volume=10)
+    await broker.update_market(101.0, candle)  # target was crossed before the TP existed
+
+    placed = await broker.place_pending_order(purpose="tp", side="long", price=105.0,
+                                              qty=0.1, client_id="cycle123456-tp-0")
+    await broker.update_market(101.0, candle)
+    status = await broker.order_status(placed["id"], side="long")
+    assert status["status"] == "open"
+    assert broker.open_qty == pytest.approx(0.1)
+
+    # A new higher wick after submission is eligible even in the same candle.
+    after_order = Candle(ts=10, open=101, high=106.2, low=100, close=101, volume=10)
+    await broker.update_market(101.0, after_order)
+    status = await broker.order_status(placed["id"], side="long")
+    assert status["status"] == "closed"
+    assert broker.open_qty == 0
+
+
+@pytest.mark.asyncio
+async def test_paper_add_ignores_same_candle_wick_that_happened_before_order_submission():
+    settings = BotSettings(trade_mode="paper", fee_pct=0.0, slippage_pct=0.0)
+    broker = PaperBroker(settings)
+    await broker.open_position("long", 10.0, 100.0)
+    candle = Candle(ts=10, open=100, high=101, low=89, close=100, volume=10)
+    await broker.update_market(100.0, candle)  # add level was crossed before order existed
+
+    placed = await broker.place_pending_order(purpose="add", side="long", price=90.0,
+                                              volume_usd=9.0, client_id="cycle123456-add-2")
+    await broker.update_market(100.0, candle)
+    status = await broker.order_status(placed["id"], side="long")
+    assert status["status"] == "open"
+    assert broker.open_qty == pytest.approx(0.1)
+
+
+@pytest.mark.asyncio
 async def test_runtime_stages_add_and_tp_then_closes_on_intrabar_tp_wick(tmp_path):
     settings = BotSettings(trade_mode="paper", fee_pct=0.0, slippage_pct=0.0)
     runtime = BotRuntime(Database(str(tmp_path / "pending.sqlite3")), settings)

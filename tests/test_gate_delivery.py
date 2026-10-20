@@ -210,8 +210,8 @@ async def test_runtime_reacts_to_candles_from_the_exchange(tmp_path, monkeypatch
     assert runtime.engine.cycle is not None, "стратегия должна была открыть цикл"
     assert runtime.engine.cycle.side == "long"
     assert runtime.engine.signals_found >= 1
-    assert runtime.engine.last_check.startswith("сигнал")
-    assert "движение" not in runtime.engine.last_check
+    assert any("сигнал:" in entry["message"] for entry in runtime.logs)
+    assert runtime.engine.last_check.startswith("в позиции")
     snapshot = runtime.snapshot()
     assert snapshot["data_real"] is True
     assert snapshot["engine"]["last_candle_ts"] == impulse[-1].ts

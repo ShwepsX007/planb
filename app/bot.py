@@ -440,13 +440,9 @@ class BotRuntime:
                 self.loop_count += 1
                 self.last_loop_ts = now_ms()
                 live_candle = getattr(self.feed, "live", None)
-                if price > 0:
-                    await self.broker.update_market(price, live_candle)
-                    # First update swing extrema/target from this tick's OHLC, then
-                    # account for fills from the resting orders at those levels.
-                    actions = self.engine.on_tick(price, live_candle)
-                    await self._poll_managed_orders()
-                    await self._execute(actions)
+                # Feed.poll returns newly closed candles before the current tick.
+                # Process them chronologically: handling the live tick first can
+                # open a cycle, then replay an older candle against its fresh TP.
                 for candle in new_candles:
                     self._remember_candle(candle)
                     await self.broker.update_market(candle.close, candle)
@@ -455,11 +451,18 @@ class BotRuntime:
                     if self.paused:
                         actions = [a for a in actions if a.kind == "close_all"]
                     await self._execute(actions)
-                await self._sync_cycle_orders()
-                # В paper OHLC диапазон способен заполнить лимит даже если цена
-                # успела коснуться уровня и вернуться между опросами.
-                if isinstance(self.broker, PaperBroker) and price > 0:
+                if price > 0:
                     await self.broker.update_market(price, live_candle)
+                    # Strategy updates the grid from the current tick before
+                    # synchronizing newly derived add/TP orders.
+                    actions = self.engine.on_tick(price, live_candle)
+                    await self._poll_managed_orders()
+                    await self._execute(actions)
+                await self._sync_cycle_orders()
+                # Give paper orders one price-only check after submission. Do not
+                # reuse this candle's old high/low: those wicks may predate the order.
+                if isinstance(self.broker, PaperBroker) and price > 0:
+                    await self.broker.update_market(price)
                     await self._poll_managed_orders()
                 if self.loop_count % 5 == 0:
                     await self._refresh_account()
