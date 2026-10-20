@@ -91,6 +91,8 @@ async def test_runtime_stages_add_and_tp_then_closes_on_intrabar_tp_wick(tmp_pat
     assert chart_order["role"] == "add"
     assert chart_order["volume_usd"] == pytest.approx(10.0)
     assert chart_order["qty"] == pytest.approx(10.0 / 91.0)
+    snapshot_orders = runtime.snapshot()["pending_orders"]
+    assert {order["role"] for order in snapshot_orders} == {"add", "tp"}
 
     # Add fills on the wick; after observing it, target order is resized to all qty.
     await runtime.broker.update_market(92.0, Candle(ts=20, open=95, high=96,

@@ -34,8 +34,7 @@
 </header>
 
 <nav class="tabs">
-  <button class="tab active" data-tab="dashboard">Панель</button>
-  <button class="tab" data-tab="chart">График</button>
+  <button class="tab active" data-tab="chart">График + обзор</button>
   <button class="tab" data-tab="positions">Позиции</button>
   <button class="tab" data-tab="history">Циклы и сделки</button>
   <button class="tab" data-tab="backtest">Бэктест</button>
@@ -44,8 +43,27 @@
 </nav>
 
 <main>
-  <!-- ============================================================ dashboard -->
-  <section class="panel active" id="tab-dashboard">
+  <!-- ============================================================ chart + overview -->
+  <section class="panel active" id="tab-chart">
+    <div class="box">
+      <div class="box-head">
+        <h2>График <span id="chartPair" class="muted"></span></h2>
+        <div class="row">
+          <button class="btn btn-small" id="btnFit">Всё</button>
+          <label class="switch"><input type="checkbox" id="chkFib" checked> Сетка Фибо</label>
+          <label class="switch"><input type="checkbox" id="chkMarks" checked> Сделки</label>
+        </div>
+      </div>
+      <div id="chart" class="chart"></div>
+      <div class="legend chart-legend">
+        <span><i class="dot" style="background:#ffffff"></i> цель (уровень коррекции)</span>
+        <span><i class="dot" style="background:#4da3ff"></i> средняя цена входа</span>
+        <span><i class="dot" style="background:#26a69a"></i> вход/долив</span>
+        <span><i class="dot" style="background:#f0b90b"></i> уровень 0.5</span>
+      </div>
+    </div>
+
+    <div class="overview-heading"><h2>Состояние бота и позиции</h2><span class="muted">Обзор обновляется вместе с графиком</span></div>
     <div id="stateHint" class="hint-banner hidden"></div>
     <div class="cards">
       <div class="card"><div class="card-label">Общий профит</div>
@@ -103,6 +121,20 @@
       </table>
     </div>
 
+    <div class="grid2">
+      <div class="box">
+        <h2>Выставленные заявки</h2>
+        <div id="pendingOrdersBox" class="kv"><div class="k">Заявки</div><div class="v">—</div></div>
+      </div>
+      <div class="box">
+        <div class="box-head"><h2>Последние циклы</h2><button class="btn btn-small" id="btnRefreshRecentCycles">Обновить</button></div>
+        <table class="tbl" id="chartRecentCycles">
+          <thead><tr><th>Цикл</th><th>Позиций</th><th>Средняя</th><th>Цель</th><th>P/L, $</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+
     <div class="box">
       <h2>Логика расчёта</h2>
       <div class="legend">
@@ -131,27 +163,6 @@
         <p id="lgCostWarn" class="legend-warn hidden"></p>
       </div>
       <div class="schedule" id="scheduleBox"></div>
-    </div>
-  </section>
-
-  <!-- ================================================================ chart -->
-  <section class="panel" id="tab-chart">
-    <div class="box">
-      <div class="box-head">
-        <h2>График <span id="chartPair" class="muted"></span></h2>
-        <div class="row">
-          <button class="btn btn-small" id="btnFit">Всё</button>
-          <label class="switch"><input type="checkbox" id="chkFib" checked> Сетка Фибо</label>
-          <label class="switch"><input type="checkbox" id="chkMarks" checked> Сделки</label>
-        </div>
-      </div>
-      <div id="chart" class="chart"></div>
-      <div class="legend chart-legend">
-        <span><i class="dot" style="background:#ffffff"></i> цель (уровень коррекции)</span>
-        <span><i class="dot" style="background:#4da3ff"></i> средняя цена входа</span>
-        <span><i class="dot" style="background:#26a69a"></i> вход/долив</span>
-        <span><i class="dot" style="background:#f0b90b"></i> уровень 0.5</span>
-      </div>
     </div>
   </section>
 

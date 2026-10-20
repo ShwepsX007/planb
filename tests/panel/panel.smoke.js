@@ -57,6 +57,7 @@ const snapshot = {
   started_at: Date.now() - 60000, last_loop_ts: Date.now(), loop_count: 42,
   price: 59500.5, balance: { mode: 'paper', total: 1005.25, free: 1005.25, used: 160, start_balance: 1000 },
   exchange_position: 0, grid: null, target_total_profit: 50,
+  pending_orders: [{ role: 'add', idx: 4, price: 58800, volume_usd: 40, qty: 0.00068, status: 'open' }],
   total_progress_pct: 10.5, volume_schedule: [10, 10, 20, 40, 80, 160], updated_at: Date.now(),
   engine: {
     stopped: false, stop_reason: '', last_check: 'долив #3: профит до цели 0.15% <= 0.2%',
@@ -342,12 +343,16 @@ setTimeout(async () => {
   chartTab.dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
   await new Promise((r) => setTimeout(r, 400));
   check('график запросил свечи', calls.some((c) => c.includes('/api/candles')));
-  const targets = drawnLines.filter((l) => l.title === 'цель');
+  const targets = drawnLines.filter((l) => String(l.title).includes('цель'));
   check('линия цели на графике одна', targets.length === 1, `линий цели: ${targets.length}`);
   check('уровни сетки нарисованы', drawnLines.filter((l) => l.title !== 'цель' && l.title !== 'средняя').length >= 7,
     `линий: ${drawnLines.length}`);
-  check('вкладка графика активна', $('tab-chart').classList.contains('active'));
-  check('вкладка панели скрыта', !$('tab-dashboard').classList.contains('active'));
+  check('объединённая вкладка графика и обзора активна', $('tab-chart').classList.contains('active')
+    && chartTab.textContent.includes('обзор'));
+  check('обзор расположен под графиком', $('tab-chart').querySelector('#chart').compareDocumentPosition($('stateHint'))
+    & window.Node.DOCUMENT_POSITION_FOLLOWING);
+  check('обзорные данные сохранены', $('pendingOrdersBox').textContent.includes('Долив #4')
+    && window.document.querySelectorAll('#chartRecentCycles tbody tr').length === 1);
 
   // открытые позиции
   const posTab = Array.from(window.document.querySelectorAll('.tab')).find((t) => t.dataset.tab === 'positions');

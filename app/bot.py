@@ -941,7 +941,9 @@ class BotRuntime:
             "exchange_position": self.exchange_position,
             "engine": engine_state,
             "grid": grid,
-            "pending_orders": [order for order in self._managed_orders.values() if order],
+            "pending_orders": [
+                {"role": role, **order} for role, order in self._managed_orders.items() if order
+            ],
             "target_total_profit": self.settings.total_profit_target_usd,
             "total_progress_pct": round(
                 self.engine.realized_pnl / self.settings.total_profit_target_usd * 100, 2

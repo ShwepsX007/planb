@@ -163,6 +163,7 @@ function renderSnapshot(s) {
   renderStateHint(s, e, c);
   renderCycleBox(c, e, s);
   renderCurrentPositions(c);
+  renderPendingOrders(s.pending_orders || []);
   renderEngineBox(e, s, c);
   renderLogic(s);
   if (app.chartTabActive) maybeUpdateChart();
@@ -363,6 +364,23 @@ function renderCurrentPositions(c) {
   }).join('');
 }
 
+function renderPendingOrders(orders) {
+  const box = $('pendingOrdersBox');
+  if (!box) return;
+  if (!orders.length) {
+    box.innerHTML = '<div class="k">Заявки</div><div class="v muted">нет активных заявок</div>';
+    return;
+  }
+  box.innerHTML = orders.map((order) => {
+    const isTp = order.role === 'tp';
+    const label = isTp ? 'Тейк-профит' : `Долив #${order.idx ?? '—'}`;
+    const detail = isTp
+      ? `${fmt(order.qty, 6)} · цена ${fmt(order.price, 2)}`
+      : `${fmt(order.volume_usd, 2)} $ · цена ${fmt(order.price, 2)}`;
+    return `<div class="k">${label}</div><div class="v">${detail} <span class="muted">(${escapeHtml(order.status || 'активна')})</span></div>`;
+  }).join('');
+}
+
 function renderLogic(s) {
   const st = app.settings || {};
   const swing = (st.entry_mode || 'swing') !== 'impulse';
@@ -552,8 +570,31 @@ async function loadHistory() {
   try {
     const [cy, pos] = await Promise.all([api('GET', '/api/cycles?limit=200'), api('GET', '/api/positions?limit=300')]);
     app.cycles = cy.cycles || []; app.trades = pos.positions || [];
-    renderCycles(); renderTrades();
+    renderCycles(); renderTrades(); renderRecentCycles();
   } catch (e) { toast('Не удалось загрузить историю: ' + e.message, 'err'); }
+}
+
+async function refreshRecentCycles() {
+  try {
+    const data = await api('GET', '/api/cycles?limit=5');
+    app.recentCycles = data.cycles || [];
+    renderRecentCycles();
+  } catch (_) { /* keep the last rendered cycles during transient API failures */ }
+}
+
+function renderRecentCycles() {
+  const table = $('chartRecentCycles');
+  if (!table) return;
+  const tbody = table.querySelector('tbody');
+  const cycles = app.recentCycles || app.cycles.slice(0, 5);
+  if (!cycles.length) {
+    tbody.innerHTML = '<tr class="empty"><td colspan="5">завершённых циклов пока нет</td></tr>';
+    return;
+  }
+  tbody.innerHTML = cycles.slice(0, 5).map((c) => `<tr>
+    <td title="${escapeHtml(c.id)}">${escapeHtml(String(c.id).slice(-8))}</td>
+    <td>${fmt(c.positions_count, 0)}</td><td>${fmt(c.avg_entry, 2)}</td>
+    <td>${fmt(c.target, 2)}</td><td class="${cls(c.pnl)}"><b>${money(c.pnl, 4)}</b></td></tr>`).join('');
 }
 
 function renderCycles() {
@@ -1243,6 +1284,7 @@ function switchTab(name) {
   if (app.chartTabActive) { setTimeout(() => { updateChart(true); }, 50); }
   if (name === 'history') loadHistory();
   if (name === 'positions') loadPositions();
+  if (app.chartTabActive) refreshRecentCycles();
   if (app.chart) app.chart.applyOptions({ width: $('chart').clientWidth, height: $('chart').clientHeight });
   if (app.btEquity) app.btEquity.applyOptions({ width: $('btEquity').clientWidth });
   if (app.btChart) app.btChart.applyOptions({ width: $('btChart').clientWidth });
@@ -1298,6 +1340,7 @@ async function init() {
   $('btnTestApi').onclick = testApi;
   $('btnRefreshPos').onclick = loadPositions;
   $('btnRefreshCycles').onclick = loadHistory;
+  $('btnRefreshRecentCycles').onclick = refreshRecentCycles;
   $('btnExportCycles').onclick = exportCyclesCsv;
   $('btnRunBacktest').onclick = runBacktestFromExchange;
   $('btnRunCsv').onclick = runBacktestFromCsv;
@@ -1328,6 +1371,8 @@ async function init() {
   (logs.logs || []).forEach(pushLog);
   connectWS();
   loadHistory();
+  switchTab('chart');
+  setInterval(() => { if (app.chartTabActive) refreshRecentCycles(); }, 30000);
   // страховка: если WebSocket недоступен (прокси/авторизация) — опрашиваем API
   let failures = 0;
   setInterval(async () => {

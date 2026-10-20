@@ -56,6 +56,8 @@ button:disabled{opacity:.5;cursor:not-allowed}
 .tab:hover{color:var(--text)}
 .tab.active{color:var(--text);border-bottom-color:var(--green)}
 main{padding:16px 18px 60px;max-width:1600px;margin:0 auto}
+.overview-heading{display:flex;align-items:baseline;justify-content:space-between;gap:10px;flex-wrap:wrap;margin:22px 2px 12px}
+.overview-heading h2{margin:0;font-size:16px}
 .panel{display:none}
 .panel.active{display:block}
 
