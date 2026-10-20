@@ -202,6 +202,45 @@ class StrategyEngine:
         cycle.target = retrace_price(cycle.swing_low, cycle.swing_high,
                                      cycle.move_side, cycle.goal_pct)
 
+    def next_add_plan(self, current_price: float = 0.0) -> Optional[Dict[str, Any]]:
+        """Рассчитать лимитный уровень следующего усреднения.
+
+        Уровень выводится из условия стратегии: расстояние от средней позиции до
+        обновляемой цели Фибо становится не больше ``min_profit_pct``. Это дает
+        заранее видимую цену заявки, а не сигнал, возникающий только после касания.
+        """
+        cycle = self.cycle
+        s = self.settings
+        if cycle is None or not cycle.positions or len(cycle.positions) >= s.max_positions:
+            return None
+        if not cycle.open_positions:
+            return None
+        ratio = cycle.goal_pct / 100.0
+        if ratio >= 1.0 or ratio <= 0.0:
+            return None  # для внешней/нулевой коррекции уровень усреднения не выводится
+        epsilon = max(cycle.avg_entry * 1e-6, 1e-8)
+        min_profit = s.min_profit_pct / 100.0
+        if cycle.side == "long":
+            threshold_target = cycle.avg_entry * (1.0 + min_profit)
+            trigger = (threshold_target - ratio * cycle.swing_high) / (1.0 - ratio)
+            if s.require_new_extreme_for_add:
+                trigger = min(trigger, cycle.extreme_at_last_entry - epsilon)
+            if current_price > 0 and current_price <= trigger:
+                trigger = current_price  # marketable limit; already crossed while polling
+        else:
+            threshold_target = cycle.avg_entry * (1.0 - min_profit)
+            trigger = (threshold_target - ratio * cycle.swing_low) / (1.0 - ratio)
+            if s.require_new_extreme_for_add:
+                trigger = max(trigger, cycle.extreme_at_last_entry + epsilon)
+            if current_price > 0 and current_price >= trigger:
+                trigger = current_price
+        if trigger <= 0:
+            return None
+        idx = len(cycle.positions) + 1
+        return {"idx": idx, "side": cycle.side, "price": trigger,
+                "volume_usd": s.volume_for_position(idx),
+                "target": cycle.target}
+
     def _tick_add(self, cycle: Cycle, price: float, ts: int) -> List[Action]:
         """Проверить условие долива на текущей цене, а не на закрытии свечи."""
         s = self.settings
@@ -445,16 +484,27 @@ class StrategyEngine:
         if action.kind == "entry":
             cycle.positions = []
             cycle.opened_ts = fill.ts or now_ms()
-        pos = Position(
-            idx=action.position_idx,
-            ts=fill.ts or now_ms(),
-            price=fill.price,
-            qty=fill.qty,
-            volume_usd=fill.qty * fill.price,
-            fee=fill.fee,
-            multiplier=self.settings.volume_for_position(action.position_idx) / self.settings.base_volume_usd,
-        )
-        cycle.positions.append(pos)
+        existing = next((p for p in cycle.positions
+                         if p.idx == action.position_idx and p.is_open), None)
+        if existing is not None:
+            total_qty = existing.qty + fill.qty
+            if total_qty > 0:
+                existing.price = (existing.price * existing.qty + fill.price * fill.qty) / total_qty
+            existing.qty = total_qty
+            existing.volume_usd += fill.qty * fill.price
+            existing.fee += fill.fee
+            pos = existing
+        else:
+            pos = Position(
+                idx=action.position_idx,
+                ts=fill.ts or now_ms(),
+                price=fill.price,
+                qty=fill.qty,
+                volume_usd=fill.qty * fill.price,
+                fee=fill.fee,
+                multiplier=self.settings.volume_for_position(action.position_idx) / self.settings.base_volume_usd,
+            )
+            cycle.positions.append(pos)
         cycle.extreme_at_last_entry = cycle.swing_low if cycle.side == "long" else cycle.swing_high
         cycle.max_positions_used = max(cycle.max_positions_used, len(cycle.positions))
         cycle.target = retrace_price(cycle.swing_low, cycle.swing_high,

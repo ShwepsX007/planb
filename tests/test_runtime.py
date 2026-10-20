@@ -205,7 +205,7 @@ async def test_reset_cycle_clears_accounting(tmp_path):
 
 # ------------------------------------------------------- смена рынка/символа
 @pytest.mark.asyncio
-async def test_market_change_pauses_instead_of_trading_a_new_market(tmp_path):
+async def test_market_change_is_rejected_while_cycle_has_positions(tmp_path):
     runtime = make_runtime(tmp_path)
     await runtime.start(runtime.settings)
     put_cycle(runtime)
@@ -214,10 +214,11 @@ async def test_market_change_pauses_instead_of_trading_a_new_market(tmp_path):
     new_settings = BotSettings(**{**runtime.settings.model_dump(), "timeframe": "5m"})
     result = await runtime.apply_settings(new_settings)
 
-    assert result["restarted"] is True
-    assert result["paused_after_restart"] is True
-    assert runtime.status == STATUS_PAUSED and runtime.paused is True
-    assert runtime.engine.cycle is not None          # цикл сохранён, но не торгуется
+    assert result["ok"] is False
+    assert "открытом цикле" in result["error"]
+    assert result["restarted"] is False
+    assert runtime.settings.timeframe != "5m"
+    assert runtime.engine.cycle is not None
     await runtime.stop()
 
 

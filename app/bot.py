@@ -63,6 +63,7 @@ class BotRuntime:
         #: фоновые задания бэктеста (загрузка истории — долгая операция)
         self.backtest_jobs: Dict[str, Dict[str, Any]] = {}
         self._backtest_tasks: Dict[str, asyncio.Task] = {}
+        self._managed_orders: Dict[str, Optional[Dict[str, Any]]] = {"add": None, "tp": None}
         self._load_state()
 
     # ------------------------------------------------------------------ state
@@ -88,6 +89,8 @@ class BotRuntime:
     def _load_state(self) -> None:
         state = self.db.load_runtime_state()
         self.engine.restore(state.get("cycle_raw"))
+        stored_orders = self.db.kv_get("managed_orders", {}) or {}
+        self._managed_orders = {"add": stored_orders.get("add"), "tp": stored_orders.get("tp")}
         self.engine.realized_pnl = float(state.get("realized_pnl", 0.0))
         self.engine.cycles_total = int(state.get("cycles_total", 0))
         self.engine.wins = int(state.get("wins", 0))
@@ -110,6 +113,7 @@ class BotRuntime:
             self.db.save_cycle(self.engine.cycle)
             for pos in self.engine.cycle.positions:
                 self.db.save_position(self.engine.cycle, pos)
+        self.db.kv_set("managed_orders", self._managed_orders)
 
     # ------------------------------------------------------------------- logs
     def log(self, level: str, message: str, *, persist: bool = True) -> None:
@@ -173,6 +177,15 @@ class BotRuntime:
                 self.broker = make_broker(self.settings)
                 timeout = self._net_timeout()
                 await asyncio.wait_for(self.broker.start(), timeout=timeout)
+                if isinstance(self.broker, PaperBroker):
+                    self.broker.restore_cycle(self.engine.cycle)
+                    self._managed_orders = {"add": None, "tp": None}
+                    self.db.kv_set("managed_orders", self._managed_orders)
+                if self.settings.trade_mode == "live":
+                    # Проверяем чтение баланса и разрешения API до запуска торгового цикла.
+                    self.balance = await asyncio.wait_for(self.broker.balance(), timeout=timeout)
+                    if float(self.balance.get("total") or 0.0) <= 0:
+                        raise BrokerError("на Gate.io нулевой доступный баланс — live-торговля не запущена")
                 # сетевые запросы к бирже ограничены по времени: иначе «зависшая»
                 # биржа оставляла бота и панель без ответа на неопределённый срок
                 history = await asyncio.wait_for(self.feed.history(self.settings.candle_lookback),
@@ -207,6 +220,7 @@ class BotRuntime:
                                      f"{target:g}$ — увеличьте цель или сбросьте статистику, "
                                      f"иначе бот остановится после первого цикла")
                 await self._reconcile(first=True)
+                await self._sync_cycle_orders()
                 return {"ok": True, "status": self.status}
             except asyncio.TimeoutError:
                 self.status = STATUS_ERROR
@@ -255,17 +269,31 @@ class BotRuntime:
 
     async def stop(self, *, reason: str = "остановлен пользователем") -> Dict[str, Any]:
         async with self._lock:
+            self.paused = True
+            if not await self._cancel_managed_order("add"):
+                return {"ok": False, "error": "биржа не подтвердила отмену доливочного ордера"}
+            await self._sync_cycle_orders()  # TP остаётся установленным на обновлённый объём
+            if (self.engine.cycle is not None and self.settings.trade_mode == "live"
+                    and not self._managed_orders.get("tp")):
+                return {"ok": False, "error": "позиция открыта, но TP не подтверждён; бот оставлен запущенным"}
+            if self.engine.cycle is None and not await self._cancel_managed_order("tp"):
+                return {"ok": False, "error": "биржа не подтвердила отмену TP-ордера"}
             self._persist_state()
             await self._teardown()
             self._set_desired_running(False)
             self.status = STATUS_STOPPED
             self.log("info", f"Бот остановлен: {reason}")
+            if self.engine.cycle is not None and self._managed_orders.get("tp"):
+                self.log("warn", "на бирже оставлен активный TP открытой позиции; доливы отменены. "
+                                  "Не удаляйте TP вручную, если позиция ещё открыта.")
             return {"ok": True, "status": self.status}
 
     async def pause(self) -> Dict[str, Any]:
         self.paused = True
         if self.status == STATUS_RUNNING:
             self.status = STATUS_PAUSED
+        await self._cancel_managed_order("add")
+        await self._sync_cycle_orders()  # сохранить/обновить TP на полный объём
         self.log("info", "Пауза: новые сделки и доливы не открываются, цель по открытому циклу "
                          "продолжает отслеживаться")
         return {"ok": True, "status": self.status}
@@ -284,11 +312,22 @@ class BotRuntime:
         if cycle is None or self.broker is None:
             return {"ok": False, "error": "нет открытых позиций"}
         try:
+            if not await self._cancel_managed_order("add"):
+                return {"ok": False, "error": "биржа не подтвердила отмену доливочного ордера"}
+            if not await self._cancel_managed_order("tp"):
+                return {"ok": False, "error": "биржа не подтвердила отмену TP-ордера"}
+            cycle = self.engine.cycle
+            if cycle is None:
+                return {"ok": True, "message": "TP исполнился при отмене заявки"}
             price = await self.broker.last_price() or self.engine.last_price
             fill = await self.broker.close_position(cycle.side, cycle.total_qty, price,
                                                     ts=now_ms(), reason=reason)
             closed = self.engine.close_cycle(fill.price, fill.ts or now_ms(), reason, fee=fill.fee)
+            self._managed_orders = {"add": None, "tp": None}
             self._persist_state()
+            self.db.save_cycle(closed)
+            for pos in closed.positions:
+                self.db.save_position(closed, pos)
             self.log("warn", f"Все позиции закрыты вручную по {fill.price:g}: {closed.pnl:+.4f}$")
             await self._notify(f"PlanB: ручное закрытие, результат {closed.pnl:+.4f}$")
             return {"ok": True, "pnl": closed.pnl, "price": fill.price}
@@ -305,6 +344,13 @@ class BotRuntime:
         cycle = self.engine.cycle
         if cycle is None:
             return {"ok": False, "error": "нет незакрытого цикла"}
+        if not await self._cancel_managed_order("add"):
+            return {"ok": False, "error": "биржа не подтвердила отмену доливочного ордера"}
+        if not await self._cancel_managed_order("tp"):
+            return {"ok": False, "error": "биржа не подтвердила отмену TP-ордера"}
+        cycle = self.engine.cycle
+        if cycle is None:
+            return {"ok": True, "message": "TP исполнился при отмене заявки"}
         price = self.engine.last_price or cycle.avg_entry
         closed = self.engine.close_cycle(price, now_ms(), reason)
         self._persist_state()
@@ -341,6 +387,12 @@ class BotRuntime:
             or new_settings.timeframe != old.timeframe
             or new_settings.trade_mode != old.trade_mode
         )
+        if market_changed and self.engine.cycle is not None:
+            message = ("нельзя сменить рынок, таймфрейм или режим торговли при открытом цикле: "
+                       "сначала закройте позицию и отмените отложенные заявки")
+            self.log("error", message)
+            return {"ok": False, "error": message, "restarted": False,
+                    "connection_changed": False, "paused_after_restart": self.paused}
         # Для этих настроек мало поменять поле: нужен новый фид/брокер. Раньше такие
         # изменения (например скорость демо-рынка) молча не применялись, потому что
         # start() выходил с «бот уже запущен» — теперь перезапускаем явно.
@@ -387,20 +439,28 @@ class BotRuntime:
                 new_candles, price = await self.feed.poll()
                 self.loop_count += 1
                 self.last_loop_ts = now_ms()
+                live_candle = getattr(self.feed, "live", None)
                 if price > 0:
-                    if isinstance(self.broker, PaperBroker):
-                        await self.broker.set_price(price)
-                    # Живая формирующаяся свеча нужна движку для входа по достигнутому
-                    # порогу и пересчёта сетки/доливов до закрытия таймфрейма.
-                    live_candle = getattr(self.feed, "live", None)
+                    await self.broker.update_market(price, live_candle)
+                    # First update swing extrema/target from this tick's OHLC, then
+                    # account for fills from the resting orders at those levels.
                     actions = self.engine.on_tick(price, live_candle)
+                    await self._poll_managed_orders()
                     await self._execute(actions)
                 for candle in new_candles:
                     self._remember_candle(candle)
+                    await self.broker.update_market(candle.close, candle)
                     actions = self.engine.on_candle(candle)
+                    await self._poll_managed_orders()
                     if self.paused:
                         actions = [a for a in actions if a.kind == "close_all"]
                     await self._execute(actions)
+                await self._sync_cycle_orders()
+                # В paper OHLC диапазон способен заполнить лимит даже если цена
+                # успела коснуться уровня и вернуться между опросами.
+                if isinstance(self.broker, PaperBroker) and price > 0:
+                    await self.broker.update_market(price, live_candle)
+                    await self._poll_managed_orders()
                 if self.loop_count % 5 == 0:
                     await self._refresh_account()
                 if self.loop_count % 5 == 0:
@@ -561,7 +621,11 @@ class BotRuntime:
             return
         for action in actions:
             try:
-                if action.kind in ("entry", "add"):
+                if action.kind == "add":
+                    # Усреднения теперь заранее выставляются как биржевые limit-ордера;
+                    # action служит резервным сигналом для пересчёта плана, не market-заявкой.
+                    continue
+                if action.kind == "entry":
                     if self.paused:
                         continue
                     fill = await self.broker.open_position(action.side, action.volume_usd,
@@ -589,6 +653,23 @@ class BotRuntime:
                     cycle = self.engine.cycle
                     if cycle is None:
                         continue
+                    if action.reason != "стоп-лосс":
+                        # Take-profit исполняется выставленной заранее лимитной заявкой;
+                        # не дублируем её market-закрытием по следующему тiku.
+                        self.log("info", f"цель {cycle.target:g} затронута — ожидаю исполнения "
+                                          f"лимитного TP-ордера")
+                        continue
+                    if not await self._cancel_managed_order("add"):
+                        self.paused = True
+                        self.status = STATUS_PAUSED
+                        continue
+                    if not await self._cancel_managed_order("tp"):
+                        self.paused = True
+                        self.status = STATUS_PAUSED
+                        continue
+                    cycle = self.engine.cycle
+                    if cycle is None:
+                        continue
                     fill = await self.broker.close_position(cycle.side, cycle.total_qty,
                                                             action.ref_price, action.ts,
                                                             reason=action.reason)
@@ -608,9 +689,223 @@ class BotRuntime:
                                        f"{self.engine.realized_pnl:+.4f}$")
                     await self._refresh_account()
             except BrokerError as exc:
+                if action.kind == "entry" and self.engine.cycle and not self.engine.cycle.positions:
+                    self.engine.cycle = None
+                    self._persist_state()
                 self.log("error", f"ошибка исполнения ({action.kind}): {exc}")
             except Exception as exc:  # pragma: no cover
                 self.log("error", f"непредвиденная ошибка исполнения: {exc}")
+        if self.broker is not None:
+            await self._sync_cycle_orders()
+
+    async def _cancel_managed_order(self, role: str) -> bool:
+        meta = self._managed_orders.get(role)
+        if not meta or self.broker is None:
+            return True
+        try:
+            report = await self.broker.cancel_pending_order(meta["id"], side=meta["side"])
+        except BrokerError as exc:
+            self.log("error", f"не удалось отменить {role}-ордер {meta.get('id')}: {exc}")
+            return False
+        status = str(report.get("status") or "open").lower()
+        if status not in ("closed", "canceled", "cancelled", "expired", "rejected"):
+            self.log("error", f"биржа не подтвердила отмену {role}-ордера {meta.get('id')} "
+                              f"(статус {status}); новый ордер не выставлен")
+            return False
+        if role == "add":
+            await self._consume_add_report(report, meta)
+        elif float(report.get("filled_qty") or 0.0) > 0:
+            await self._complete_take_profit(report, meta)
+        if self._managed_orders.get(role) is meta:
+            self._managed_orders[role] = None
+        self.db.kv_set("managed_orders", self._managed_orders)
+        return True
+
+    async def _poll_managed_orders(self) -> None:
+        if self.broker is None:
+            return
+        # Долив сначала: если долив и TP успели исполниться между опросами,
+        # закрытие будет рассчитано уже на полный фактический объём позиции.
+        for role in ("add", "tp"):
+            meta = self._managed_orders.get(role)
+            if not meta:
+                continue
+            try:
+                report = await self.broker.order_status(meta["id"], side=meta["side"])
+            except BrokerError as exc:
+                self.log("warn", f"не удалось проверить {role}-ордер {meta.get('id')}: {exc}")
+                continue
+            status = str(report.get("status") or "open").lower()
+            if role == "add":
+                await self._consume_add_report(report, meta)
+                if status in ("closed", "canceled", "cancelled", "expired", "rejected"):
+                    if self._managed_orders.get(role) is meta:
+                        self._managed_orders[role] = None
+                    self.db.kv_set("managed_orders", self._managed_orders)
+            elif status in ("closed", "canceled", "cancelled", "expired", "rejected"):
+                if float(report.get("filled_qty") or 0.0) > 0:
+                    await self._complete_take_profit(report, meta)
+                elif self._managed_orders.get(role) is meta:
+                    self._managed_orders[role] = None
+                    self.db.kv_set("managed_orders", self._managed_orders)
+
+    async def _consume_add_report(self, report: Dict[str, Any], meta: Dict[str, Any]) -> None:
+        cycle = self.engine.cycle
+        if cycle is None or cycle.id != meta.get("cycle_id"):
+            return
+        cumulative_qty = float(report.get("filled_qty") or 0.0)
+        applied_qty = float(meta.get("applied_qty") or 0.0)
+        delta_qty = cumulative_qty - applied_qty
+        if delta_qty <= max(1e-12, cumulative_qty * 1e-9):
+            return
+        average = float(report.get("average") or meta.get("price") or 0.0)
+        cumulative_cost = float(report.get("filled_cost") or cumulative_qty * average)
+        delta_cost = cumulative_cost - float(meta.get("applied_cost") or 0.0)
+        delta_price = delta_cost / delta_qty if delta_cost > 0 else average
+        cumulative_fee = float(report.get("fee") or 0.0)
+        delta_fee = max(0.0, cumulative_fee - float(meta.get("applied_fee") or 0.0))
+        fill = Fill(price=delta_price, qty=delta_qty, fee=delta_fee,
+                    ts=int(report.get("timestamp") or now_ms()), order_id=meta["id"])
+        action = Action(kind="add", side=cycle.side, ref_price=delta_price,
+                        volume_usd=delta_price * delta_qty, position_idx=int(meta["idx"]),
+                        target=cycle.target, reason="исполнен лимитный долив", ts=fill.ts)
+        self.engine.apply_fill(action, fill)
+        meta["applied_qty"] = cumulative_qty
+        meta["applied_cost"] = cumulative_cost
+        meta["applied_fee"] = cumulative_fee
+        self._persist_state()
+        self.log("trade", f"Исполнен лимитный долив #{action.position_idx} {cycle.side} "
+                          f"по средней цене {delta_price:g}, объём {delta_qty * delta_price:.2f}$")
+
+    async def _complete_take_profit(self, report: Dict[str, Any], meta: Dict[str, Any]) -> None:
+        cycle = self.engine.cycle
+        if cycle is None or cycle.id != meta.get("cycle_id"):
+            return
+        if not await self._cancel_managed_order("add"):
+            self.paused = True
+            self.status = STATUS_PAUSED
+            self.log("error", "TP исполнен, но доливочный ордер не отменён; цикл оставлен под "
+                              "наблюдением, бот на паузе")
+            return
+        cycle = self.engine.cycle
+        if cycle is None:
+            return
+        tp_qty = min(float(report.get("filled_qty") or 0.0), cycle.total_qty)
+        if tp_qty <= 0:
+            return
+        tp_price = float(report.get("average") or meta.get("price") or cycle.target)
+        tp_fee = float(report.get("fee") or 0.0)
+        remaining = max(0.0, cycle.total_qty - tp_qty)
+        combined_cost = tp_qty * tp_price
+        combined_fee = tp_fee
+        if remaining > max(1e-12, cycle.total_qty * 1e-9):
+            # Защищаемся от частичного исполнения TP: закрываем остаток reduce-only
+            # после того, как биржа подтвердила завершение/отмену лимитной заявки.
+            try:
+                market_fill = await self.broker.close_position(
+                    cycle.side, remaining, self.engine.last_price or cycle.target,
+                    ts=now_ms(), reason="остаток после лимитного TP")
+            except BrokerError as exc:
+                self.paused = True
+                self.status = STATUS_PAUSED
+                self.log("error", f"TP исполнен частично, остаток не закрыт — бот на паузе: {exc}")
+                return
+            combined_cost += market_fill.qty * market_fill.price
+            combined_fee += market_fill.fee
+            tp_qty += market_fill.qty
+        fill_price = combined_cost / tp_qty if tp_qty > 0 else cycle.target
+        closed = self.engine.close_cycle(fill_price, now_ms(), "тейк-профит по Фибо", fee=combined_fee)
+        self._managed_orders["tp"] = None
+        self._managed_orders["add"] = None
+        self._persist_state()
+        self.db.save_cycle(closed)
+        for pos in closed.positions:
+            self.db.save_position(closed, pos)
+        self.log("trade", f"Тейк-профит исполнен по средней {fill_price:g}: "
+                          f"{closed.pnl:+.4f}$, позиций {len(closed.positions)}")
+        await self._notify(f"PlanB: TP по Фибо, результат {closed.pnl:+.4f}$")
+        await self._refresh_account()
+
+    async def _sync_cycle_orders(self) -> None:
+        """Поддерживать на брокере следующий averaging limit и TP всего цикла."""
+        if self.broker is None:
+            return
+        cycle = self.engine.cycle
+        if cycle is None or cycle.total_qty <= 0:
+            add_ok = await self._cancel_managed_order("add")
+            tp_ok = await self._cancel_managed_order("tp")
+            if add_ok and tp_ok:
+                self._managed_orders = {"add": None, "tp": None}
+                self.db.kv_set("managed_orders", self._managed_orders)
+            return
+
+        add_plan = None if self.paused else self.engine.next_add_plan(self.engine.last_price)
+        desired = {
+            "add": ({"price": float(add_plan["price"]), "qty": 0.0,
+                     "volume_usd": float(add_plan["volume_usd"]), "idx": int(add_plan["idx"]),
+                     "side": cycle.side} if add_plan else None),
+            "tp": {"price": float(cycle.target), "qty": float(cycle.total_qty),
+                   "volume_usd": 0.0, "idx": 0, "side": cycle.side},
+        }
+        for role in ("add", "tp"):
+            want = desired[role]
+            current = self._managed_orders.get(role)
+            if current and current.get("cycle_id") != cycle.id:
+                if not await self._cancel_managed_order(role):
+                    continue
+                current = None
+            if want is None:
+                if current:
+                    await self._cancel_managed_order(role)
+                continue
+            price = self.broker.normalize_price(want["price"])
+            qty = (want["volume_usd"] / price if role == "add" and price > 0
+                   else want["qty"])
+            if current:
+                if role == "add" and float(current.get("applied_qty") or 0.0) > 0 \
+                        and current.get("status", "open") == "open":
+                    # Частичный fill той же заявки: не отменяем остаток и не перескакиваем
+                    # на следующий индекс, пока биржа не завершила текущий лимит.
+                    continue
+                same_price = abs(float(current.get("price") or 0.0) - price) <= max(price * 1e-9, 1e-10)
+                same_qty = role == "add" or abs(float(current.get("requested_qty", current.get("qty")) or 0.0) - qty) <= max(qty * 1e-8, 1e-12)
+                same_size = role == "tp" or abs(float(current.get("requested_volume_usd", current.get("volume_usd")) or 0.0) - want["volume_usd"]) < 1e-8
+                if same_price and same_qty and same_size and current.get("status", "open") == "open":
+                    continue
+                if not await self._cancel_managed_order(role):
+                    continue
+                if self.engine.cycle is None:
+                    return
+                cycle = self.engine.cycle
+            client_id = f"{cycle.id[:12]}-{role[:1]}-{want['idx']}-{now_ms() % 1_000_000}"
+            try:
+                placed = await self.broker.place_pending_order(
+                    purpose=role, side=cycle.side, price=price,
+                    volume_usd=want["volume_usd"], qty=qty, client_id=client_id)
+            except BrokerError as exc:
+                self.log("error" if role == "tp" else "warn",
+                         f"не удалось выставить {('тейк-профит' if role == 'tp' else 'долив')} "
+                         f"по {price:g}: {exc}")
+                if role == "tp" and self.settings.trade_mode == "live":
+                    self.paused = True
+                    self.status = STATUS_PAUSED
+                    self.log("error", "открытая позиция не защищена TP-ордером — новые сделки остановлены")
+                continue
+            self._managed_orders[role] = {
+                **want, "id": str(placed["id"]), "cycle_id": cycle.id,
+                "price": float(placed.get("price") or price),
+                "qty": float(placed.get("base_qty") or qty),
+                "volume_usd": float(placed.get("volume_usd") or want["volume_usd"]),
+                "requested_qty": qty, "requested_volume_usd": want["volume_usd"],
+                "status": str(placed.get("status") or "open"),
+                "applied_qty": 0.0, "applied_cost": 0.0, "applied_fee": 0.0,
+                "client_id": client_id,
+            }
+            self.db.kv_set("managed_orders", self._managed_orders)
+            label = f"лимитный долив #{want['idx']}" if role == "add" else "лимитный TP"
+            detail = (f"объём {want['volume_usd']:.2f}$" if role == "add"
+                      else f"количество {qty:g}")
+            self.log("info", f"Выставлен {label}: {price:g}, {detail}")
 
     # ---------------------------------------------------------------- snapshot
     def snapshot(self) -> Dict[str, Any]:
@@ -646,6 +941,7 @@ class BotRuntime:
             "exchange_position": self.exchange_position,
             "engine": engine_state,
             "grid": grid,
+            "pending_orders": [order for order in self._managed_orders.values() if order],
             "target_total_profit": self.settings.total_profit_target_usd,
             "total_progress_pct": round(
                 self.engine.realized_pnl / self.settings.total_profit_target_usd * 100, 2
@@ -683,9 +979,21 @@ class BotRuntime:
                 markers.append({"ts": c.closed_ts, "price": c.close_price,
                                 "text": f"{c.pnl:+.3f}$", "kind": "closed_exit",
                                 "side": c.side, "win": c.pnl >= 0})
+        pending_orders = []
+        for role, order in self._managed_orders.items():
+            if not order or order.get("cycle_id") != (cycle.id if cycle else None):
+                continue
+            pending_orders.append({
+                "role": role, "price": float(order.get("price") or 0.0),
+                "volume_usd": float(order.get("volume_usd") or 0.0),
+                "qty": float(order.get("qty") or 0.0),
+                "base": self.settings.symbol.split("/")[0],
+                "idx": int(order.get("idx") or 0), "status": order.get("status", "open"),
+            })
         return {
             "candles": [c.to_list() for c in candles],
             "levels": levels,
+            "pending_orders": pending_orders,
             "markers": markers,
             "avg_entry": cycle.avg_entry if cycle else None,
             "target": cycle.target if cycle else None,

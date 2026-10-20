@@ -486,9 +486,18 @@ async function updateChart(force = false) {
     if (data.target) {
       app.priceLines.push(app.series.createPriceLine({
         price: data.target, color: '#ffffff', lineWidth: 2,
-        lineStyle: LWC.LineStyle.Solid, axisLabelVisible: true, title: 'цель',
+        lineStyle: LWC.LineStyle.Solid, axisLabelVisible: true, title: 'цель / TP',
       }));
     }
+    (data.pending_orders || []).filter((order) => order.role === 'add').forEach((order) => {
+      const amount = Number(order.volume_usd || 0).toLocaleString(undefined, { maximumFractionDigits: 2 });
+      const qty = Number(order.qty || 0).toLocaleString(undefined, { maximumFractionDigits: 6 });
+      app.priceLines.push(app.series.createPriceLine({
+        price: order.price, color: '#f0b90b', lineWidth: 2,
+        lineStyle: LWC.LineStyle.Dashed, axisLabelVisible: true,
+        title: `лимит долива #${order.idx} · $${amount} / ${qty} ${order.base || ''}`,
+      }));
+    });
   }
 
   if ($('chkMarks').checked && data.markers && data.markers.length) {

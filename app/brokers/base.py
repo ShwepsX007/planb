@@ -51,6 +51,25 @@ class Broker(ABC):
     async def exchange_position(self, side: Side) -> float:
         """Current position size in base currency (0 if flat)."""
 
+    async def place_pending_order(self, *, purpose: str, side: Side, price: float,
+                                  volume_usd: float = 0.0, qty: float = 0.0,
+                                  client_id: str = "") -> Dict[str, Any]:
+        """Place a resting add limit or a reduce-only take-profit order."""
+        raise BrokerError("этот брокер не поддерживает отложенные заявки")
+
+    async def order_status(self, order_id: str, *, side: Side) -> Dict[str, Any]:
+        raise BrokerError("этот брокер не поддерживает проверку отложенных заявок")
+
+    async def cancel_pending_order(self, order_id: str, *, side: Side) -> Dict[str, Any]:
+        raise BrokerError("этот брокер не поддерживает отмену отложенных заявок")
+
+    async def update_market(self, price: float, candle=None) -> None:
+        """Paper brokers may use the full candle range to simulate limit fills."""
+        return None
+
+    def normalize_price(self, price: float) -> float:
+        return float(price)
+
     async def extra_status(self) -> Dict[str, Any]:
         return {}
 

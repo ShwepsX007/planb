@@ -290,7 +290,7 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
                 include_url=False, include_context=False)})
         new_settings = new_settings.merge_secrets(runtime.settings)
         result = await runtime.apply_settings(new_settings)
-        return {"ok": True, **result, "settings": new_settings.public_dict()}
+        return {**result, "settings": runtime.settings.public_dict()}
 
     @app.post("/api/settings/test-connection")
     async def test_connection(payload: Optional[Dict[str, Any]] = None):
