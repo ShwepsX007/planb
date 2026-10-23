@@ -55,6 +55,52 @@ def test_fresh_install_waits_for_start_button(tmp_path):
     assert runtime.status == STATUS_STOPPED
 
 
+def test_account_metrics_reports_number_of_active_cycles(tmp_path):
+    import copy
+
+    runtime = make_runtime(tmp_path, make_settings(allow_opposite_cycles=True))
+    put_cycle(runtime)
+    second = copy.deepcopy(runtime.engine.cycle)
+    second.id = "opposite-cycle"
+    second.side = "short"
+    second.move_side = "up"
+    runtime.engine._attach_cycle(second)
+    assert runtime.snapshot()["account_metrics"]["active_cycles"] == 2
+
+
+@pytest.mark.asyncio
+async def test_close_all_closes_every_opposite_cycle(tmp_path):
+    import copy
+
+    runtime = make_runtime(tmp_path, make_settings(allow_opposite_cycles=True))
+    put_cycle(runtime)
+    second = copy.deepcopy(runtime.engine.cycle)
+    second.id = "opposite-cycle"
+    second.side = "short"
+    second.move_side = "up"
+    runtime.engine._attach_cycle(second)
+
+    class ClosingBroker:
+        def __init__(self):
+            self.closed_sides = []
+
+        async def last_price(self):
+            return 100.0
+
+        async def close_position(self, side, qty, price, ts=None, reason=""):
+            self.closed_sides.append(side)
+            return Fill(price=price, qty=qty, fee=0.0, ts=ts)
+
+    broker = ClosingBroker()
+    runtime.broker = broker
+    result = await runtime.close_all()
+    assert result["ok"] is True
+    assert result["cycles"] == 2
+    assert set(broker.closed_sides) == {"long", "short"}
+    assert runtime.engine.active_cycles == []
+    assert runtime.snapshot()["account_metrics"]["active_cycles"] == 0
+
+
 @pytest.mark.asyncio
 async def test_autostart_flag_follows_start_and_stop(tmp_path):
     runtime = make_runtime(tmp_path)

@@ -128,10 +128,11 @@ function renderSnapshot(s) {
   $('btnStart').disabled = st === 'running';
   $('btnPause').disabled = st !== 'running';
   $('btnStop').disabled = st === 'stopped' || st === 'error';
-  $('btnCloseAll').disabled = !(s.engine && s.engine.cycle);
-
   const e = s.engine || {};
-  const c = e.cycle;
+  const activeCycles = Array.isArray(e.cycles) && e.cycles.length
+    ? e.cycles : (e.cycle ? [e.cycle] : []);
+  const c = e.cycle || activeCycles[0] || null;
+  $('btnCloseAll').disabled = activeCycles.length === 0;
 
   $('cPnl').textContent = money(e.realized_pnl, 4);
   $('cPnl').className = 'card-value ' + cls(e.realized_pnl);
@@ -140,12 +141,15 @@ function renderSnapshot(s) {
   $('cProgressBar').style.width = prog + '%';
   $('cProgressText').textContent = target ? `цель: ${fmt(target, 2)} $ · ${prog.toFixed(1)} %` : 'цель не задана';
 
-  $('cUnreal').textContent = c ? money(c.unrealized_pnl, 4) : '—';
-  $('cUnreal').className = 'card-value ' + (c ? cls(c.unrealized_pnl) : '');
-  $('cUnrealHint').textContent = c ? `оценка по цене ${fmt(s.price, s.price > 100 ? 2 : 5)}` : 'нет открытых позиций';
+  const unrealizedTotal = activeCycles.reduce((sum, cycle) => sum + Number(cycle.unrealized_pnl || 0), 0);
+  $('cUnreal').textContent = activeCycles.length ? money(unrealizedTotal, 4) : '—';
+  $('cUnreal').className = 'card-value ' + (activeCycles.length ? cls(unrealizedTotal) : '');
+  $('cUnrealHint').textContent = activeCycles.length
+    ? `${activeCycles.length} активных цикла · оценка по цене ${fmt(s.price, s.price > 100 ? 2 : 5)}`
+    : 'нет открытых позиций';
 
   $('cAvg').textContent = c ? fmt(c.avg_entry, 2) : '—';
-  $('cAvgHint').textContent = c ? `позиций: ${c.positions.length} · объём ${fmt(c.total_volume_usd, 2)} $` : 'позиций: 0';
+  $('cAvgHint').textContent = c ? `позиций: ${c.positions.length} · объём ${fmt(c.total_volume_usd, 2)} $ · циклов ${activeCycles.length}` : 'позиций: 0';
 
   $('cTarget').textContent = c ? fmt(c.target, 2) : '—';
   $('cTargetHint').textContent = c
@@ -175,8 +179,8 @@ function renderSnapshot(s) {
   $('cNextAddHint').textContent = c ? (c.next_position_idx ? `позиция #${c.next_position_idx} · осталось ${c.positions_left}` : 'лимит позиций достигнут') : '—';
 
   renderStateHint(s, e, c);
-  renderCycleBox(c, e, s);
-  renderCurrentPositions(c);
+  renderCycleBox(c, e, s, activeCycles);
+  renderCurrentPositions(activeCycles);
   renderPendingOrders(s.pending_orders || []);
   renderEngineBox(e, s, c);
   renderLogic(s);
@@ -310,24 +314,36 @@ function kv(rows) {
   return rows.map(([k, v, klass]) => `<div class="k">${k}</div><div class="v ${klass || ''}">${v}</div>`).join('');
 }
 
-function renderCycleBox(c, e, s) {
+function renderCycleBox(c, e, s, cycles = []) {
   const box = $('cycleBox');
-  if (!c) { box.innerHTML = kv([['Статус', '<span class="muted">нет активного цикла — ждём сигнал</span>'],
+  if (!cycles.length && c) cycles = [c];
+  if (!cycles.length) { box.innerHTML = kv([['Статус', '<span class="muted">нет активного цикла — ждём сигнал</span>'],
     ['Проверка', e.last_check || '—']]); return; }
-  box.innerHTML = kv([
-    ['Цикл', c.id],
-    ['Сторона', c.side === 'long' ? 'лонг (коррекция вверх)' : 'шорт (коррекция вниз)'],
-    ['Открыт', ts(c.opened_ts)],
-    ['Свечей в импульсе', c.note || '—'],
-    ['Сетка Фибо', `${fmt(c.swing_low, 2)} … ${fmt(c.swing_high, 2)}`],
-    ['Цель (' + c.goal_pct + '%)', `<b>${fmt(c.target, 2)}</b>`],
-    ['Средняя входа', `<b>${fmt(c.avg_entry, 2)}</b>`],
-    ['Профит до цели', `<b>${pct(c.profit_pct_to_target)}</b> (мин. ${app.settings?.min_profit_pct ?? '—'}%)`],
-    ['Ожидаемый профит', `${money(c.expected_pnl_at_target, 4)} при закрытии по цели`],
-    ['Позиций', `${c.positions.length} из ${app.settings?.max_positions ?? '—'} (макс. одновр. ${c.max_positions_used})`],
-    ['Вложено', `${fmt(c.total_volume_usd, 2)} $`],
-    ['До цели по цене', c.distance_to_target_pct !== undefined ? pct(c.distance_to_target_pct) : '—'],
-  ]);
+  const rows = [];
+  cycles.forEach((cycle, index) => {
+    if (index > 0) rows.push([`Встречный цикл (${cycle.side})`, `<b>${escapeHtml(cycle.id)}</b>`]);
+    rows.push(
+      [index === 0 ? 'Цикл' : `Цикл ${index + 1}`, escapeHtml(cycle.id)],
+      ['Сторона', cycle.side === 'long' ? 'лонг (коррекция вверх)' : 'шорт (коррекция вниз)'],
+      ['Открыт / длительность', `${ts(cycle.opened_ts)} · ${duration(Date.now() - cycle.opened_ts)}`],
+      ['Свечей в импульсе', escapeHtml(cycle.note || '—')],
+      ['Сетка Фибо', `${fmt(cycle.swing_low, 2)} … ${fmt(cycle.swing_high, 2)}`],
+      ['Цель (' + cycle.goal_pct + '%)', `<b>${fmt(cycle.target, 2)}</b>`],
+      ['Средняя входа', `<b>${fmt(cycle.avg_entry, 2)}</b>`],
+      ['Профит до цели', `<b>${pct(cycle.profit_pct_to_target)}</b> (мин. ${app.settings?.min_profit_pct ?? '—'}%)`],
+      ['Ожидаемый профит', `${money(cycle.expected_pnl_at_target, 4)} при закрытии по цели`],
+      ['Плавающий P/L цикла', money(cycle.unrealized_pnl, 4)],
+      ['Комиссии входа', money((cycle.positions || []).reduce((sum, position) =>
+        sum + Number(position.fee || 0), 0), 4)],
+      ['Позиций', `${cycle.positions.length} из ${app.settings?.max_positions ?? '—'} (макс. ${cycle.max_positions_used})`],
+      ['Вложено', `${fmt(cycle.total_volume_usd, 2)} $`],
+      ['Номинал / оценка маржи', `${fmt(Number(cycle.total_qty || 0) * Number(s.price || 0), 2)} $ / ` +
+        `${fmt(Number(cycle.total_qty || 0) * Number(s.price || 0) /
+          (s.market_type === 'futures' ? Math.max(1, Number(app.settings?.leverage || 1)) : 1), 2)} $`],
+      ['До цели по цене', cycle.distance_to_target_pct !== undefined ? pct(cycle.distance_to_target_pct) : '—'],
+    );
+  });
+  box.innerHTML = kv(rows);
 }
 
 function renderEngineBox(e, s, c) {
@@ -341,6 +357,7 @@ function renderEngineBox(e, s, c) {
   ];
   const account = s.account_metrics || {};
   rows.push(['Баланс total / свободно', `${fmt(account.total_balance, 2)} $ / ${fmt(account.free_balance, 2)} $`]);
+  rows.push(['Активные циклы', fmt(account.active_cycles || 0, 0)]);
   rows.push(['Занято (reported)', `${fmt(account.exchange_used, 2)} $ · ${account.used_basis || '—'}`]);
   rows.push(['Экспозиция цикла (номинал)', `${fmt(account.cycle_notional, 2)} $`]);
   rows.push(['Оценка требуемой маржи', `${fmt(account.estimated_margin, 2)} $ (${pct(account.deposit_load_pct, 2)})`]);
@@ -373,20 +390,25 @@ function renderEngineBox(e, s, c) {
   $('engineBox').innerHTML = kv(rows);
 }
 
-function renderCurrentPositions(c) {
+function renderCurrentPositions(cycles) {
   const tbody = $('currentPositions').querySelector('tbody');
-  if (!c || !c.positions || !c.positions.length) {
-    tbody.innerHTML = '<tr class="empty"><td colspan="11">позиций нет</td></tr>';
+  const active = Array.isArray(cycles) ? cycles : (cycles ? [cycles] : []);
+  const positions = active.flatMap((cycle) => (cycle.positions || []).map((position) => ({
+    ...position, side: cycle.side,
+  })));
+  if (!positions.length) {
+    tbody.innerHTML = '<tr class="empty"><td colspan="12">позиций нет</td></tr>';
     return;
   }
   const price = app.snapshot?.price || 0;
   const now = Date.now();
-  tbody.innerHTML = c.positions.map((p) => {
-    const gross = c.side === 'long' ? (price - p.price) * p.qty : (p.price - price) * p.qty;
+  tbody.innerHTML = positions.map((p) => {
+    const gross = p.side === 'long' ? (price - p.price) * p.qty : (p.price - price) * p.qty;
     const pnl = gross - Number(p.fee || 0);
     const markValue = price * p.qty;
-    return `<tr><td><b>${p.idx}</b></td><td>${ts(p.ts)}</td><td>${duration(now - p.ts)}</td>
-      <td>${fmt(p.price, 2)}</td><td>${fmt(p.volume_usd, 2)}</td><td>${fmt(p.qty, 8)}</td>
+    return `<tr><td><b>${p.idx}</b></td><td>${p.side === 'long' ? 'Лонг' : 'Шорт'}</td>
+      <td>${ts(p.ts)}</td><td>${duration(now - p.ts)}</td><td>${fmt(p.price, 2)}</td>
+      <td>${fmt(p.volume_usd, 2)}</td><td>${fmt(p.qty, 8)}</td>
       <td>${p.multiplier && p.multiplier > 1 ? `<b class="pos">x${p.multiplier}</b>` : 'x1'}</td>
       <td>${fmt(markValue, 2)}</td><td>${fmt(p.fee, 4)}</td>
       <td class="${cls(pnl)}">${money(pnl, 4)}</td><td class="${cls(pnl)}">${pct(p.volume_usd ? pnl / p.volume_usd * 100 : 0, 3)}</td></tr>`;
@@ -710,6 +732,8 @@ const FIELDS = [
     { k: 'fib_goal_pct', l: 'Цель: уровень коррекции по Фибо, %', t: 'number', step: 1, min: 1, h: '50 % — середина сетки' },
     { k: 'min_profit_pct', l: 'Минимальный профит, %', t: 'number', step: 0.05, min: 0.01 },
     { k: 'direction', l: 'Направление сделок', t: 'select', o: [['both', 'Оба направления'], ['long', 'Только лонг'], ['short', 'Только шорт']] },
+    { k: 'allow_opposite_cycles', l: 'Одновременно вести встречный цикл', t: 'bool',
+      h: 'На фьючерсах PAPER/бэктест: независимый цикл LONG и SHORT. Для LIVE требуется подтверждённый hedge-mode Gate.io.' },
     { k: 'move_measure', l: 'Как измеряется движение', t: 'select', o: [['range', 'Максимум − минимум свечей'], ['close', 'От открытия до закрытия']] },
     { k: 'candle_direction_mode', l: 'Направление свечи', t: 'select', o: [['body', 'Тело свечи (закр. ниже откр.)'], ['close', 'Последовательные закрытия']] },
     { k: 'update_swing_in_cycle', l: 'Тянуть сетку и по новым максимумам', t: 'bool' },
@@ -802,6 +826,10 @@ let btJobId = null;
 let btTimer = null;
 
 const BT_STRATEGY_FIELDS = [
+  ['direction', 'Направление сделок', 'select',
+    [['both', 'Оба направления'], ['long', 'Только лонг'], ['short', 'Только шорт']]],
+  ['leverage', 'Кредитное плечо (фьючерсы)', 'int'],
+  ['allow_opposite_cycles', 'Одновременно вести встречный цикл', 'bool'],
   ['entry_mode', 'Метод входа', 'select',
     [['swing', 'Автоматически по движению (без фиксированного N)'], ['impulse', 'Фиксированное N свечей (старый метод)']]],
   ['swing_lookback', 'Макс. окно поиска движения, свечей', 'number'],
@@ -827,6 +855,9 @@ function renderBacktestForm(settings) {
     data_mode: 'archive',
     symbol: st.symbol || 'BTC/USDT',
     market_type: st.market_type || 'futures',
+    direction: st.direction || 'both',
+    leverage: st.leverage || 1,
+    allow_opposite_cycles: Boolean(st.allow_opposite_cycles),
     timeframe: st.timeframe || '5m',
     archive_period: '2',
     period_mode: 'limit',
@@ -854,6 +885,14 @@ function renderBacktestForm(settings) {
     const value = defs[k] !== undefined ? defs[k]
       : (st[k] !== undefined && st[k] !== null ? st[k] : '');
     const fieldClass = k === 'candles_count' ? 'field bt-legacy-candles' : 'field';
+    if (t === 'bool') {
+      return `<div class="${fieldClass}"><label>${l}</label>` +
+        `<label class="switch"><input type="checkbox" id="${id}" ${value ? 'checked' : ''}> включено</label></div>`;
+    }
+    if (t === 'int') {
+      return `<div class="${fieldClass}"><label>${l}</label>` +
+        `<input type="number" step="1" min="1" max="100" id="${id}" value="${value}" autocomplete="off"></div>`;
+    }
     if (t === 'select') {
       return `<div class="${fieldClass}"><label>${l}</label><select id="${id}">` +
         o.map(([v, txt]) => `<option value="${v}" ${value === v ? 'selected' : ''}>${txt}</option>`).join('') +
@@ -948,8 +987,9 @@ function collectBacktestParams() {
     const key = el.id.slice(3);
     if (key === 'data_mode' || key === 'archive_period' || key === 'period_mode') return;
     const v = el.value;
-    if (v === '') return;
-    if (el.type === 'number') params[key] = parseFloat(v);
+    if (el.type === 'checkbox') params[key] = el.checked;
+    else if (v === '') return;
+    else if (el.type === 'number') params[key] = el.step === '1' ? parseInt(v, 10) : parseFloat(v);
     else params[key] = v.trim();
   });
   const mode = ($('bt_data_mode') || {}).value || 'archive';
@@ -1181,7 +1221,10 @@ function renderBacktestResult(r) {
     ['Максимум позиций', r.max_positions_used, `возможных ${(app.settings && app.settings.max_positions) || '—'}`],
     ['Макс. просадка', fmt(r.max_drawdown, 4) + ' $', `${pct(r.max_drawdown_pct)} · close-to-close equity`],
     ['Пиковая экспозиция', fmt(r.peak_notional_exposure, 2) + ' $', 'номинал открытых позиций'],
-    ['Пик маржи / нагрузка', fmt(r.max_margin_used_estimate, 2) + ' $', `${pct(r.max_deposit_load_pct)} · ${r.margin_method || ''}`],
+    ['Пик маржи / нагрузка', fmt(r.max_margin_used_estimate, 2) + ' $', `${pct(r.max_deposit_load_pct)} · плечо ${r.leverage || 1}x · ${r.margin_method || ''}`],
+    ['Направления', r.direction === 'long' ? 'только LONG' : (r.direction === 'short' ? 'только SHORT' : 'LONG + SHORT'),
+      r.allow_opposite_cycles ? 'встречные циклы разрешены' : 'один активный цикл'],
+    ['Входы без маржи', fmt(r.margin_rejections || 0, 0), r.busted ? `СЛИВ · ${ts(r.bust_ts)}` : 'слива не было'],
     ['Лучший цикл', money(r.best_cycle, 4), `худший ${money(r.worst_cycle, 4)}`],
     ['Прибыль/убыток', r.profit_factor === null ? '∞' : fmt(r.profit_factor, 2), `комиссии ${fmt(r.fees_total, 4)} $`],
   ];
@@ -1191,7 +1234,9 @@ function renderBacktestResult(r) {
   const d = r.data || {};
   const warnBox = $('btHint');
   if (warnBox) {
-    const warnings = d.warnings || [];
+    const warnings = [...(d.warnings || [])];
+    if (r.busted) warnings.unshift(`СЛИВ: equity опустился до ${fmt(r.final_equity, 2)} $; тест остановлен ${ts(r.bust_ts)}.`);
+    if (r.margin_rejections) warnings.push(`Отклонено входов из-за нехватки свободной маржи: ${r.margin_rejections}.`);
     warnBox.className = 'hint-banner ' + (warnings.length ? 'warn' : 'hidden');
     warnBox.innerHTML = warnings.map((w) => '⚠ ' + escapeHtml(w)).join('<br>');
   }

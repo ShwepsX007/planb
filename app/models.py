@@ -187,6 +187,7 @@ class Action:
     target: float = 0.0
     reason: str = ""
     ts: int = 0
+    cycle_id: Optional[str] = None
 
     def dict(self) -> Dict[str, Any]:
         return asdict(self)

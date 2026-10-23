@@ -84,19 +84,19 @@ class BotRuntime:
         без управления.
         """
         if self.db.kv_get("desired_running") is None:
-            return self.engine.cycle is not None      # первый запуск: ждём кнопку «Старт»
+            return bool(self.engine.active_cycles)  # первый запуск: не оставлять позицию без контроля
         return self.desired_running
 
     def _load_state(self) -> None:
         state = self.db.load_runtime_state()
-        self.engine.restore(state.get("cycle_raw"))
+        self.engine.restore(state.get("cycles_raw") or state.get("cycle_raw"))
         stored_orders = self.db.kv_get("managed_orders", {}) or {}
         self._managed_orders = {"add": stored_orders.get("add"), "tp": stored_orders.get("tp")}
         self.engine.realized_pnl = float(state.get("realized_pnl", 0.0))
         self.engine.cycles_total = int(state.get("cycles_total", 0))
         self.engine.wins = int(state.get("wins", 0))
         self.engine.losses = int(state.get("losses", 0))
-        if self.engine.cycle:
+        if self.engine.active_cycles:
             self.status = STATUS_PAUSED
             self.paused = True
 
@@ -104,16 +104,17 @@ class BotRuntime:
         snap = self.engine.snapshot()
         self.db.save_runtime_state({
             "cycle_raw": snap["cycle_raw"],
+            "cycles_raw": snap["cycles_raw"],
             "realized_pnl": snap["realized_pnl"],
             "cycles_total": snap["cycles_total"],
             "wins": snap["wins"],
             "losses": snap["losses"],
             "updated_at": now_ms(),
         })
-        if self.engine.cycle:
-            self.db.save_cycle(self.engine.cycle)
-            for pos in self.engine.cycle.positions:
-                self.db.save_position(self.engine.cycle, pos)
+        for cycle in self.engine.active_cycles:
+            self.db.save_cycle(cycle)
+            for pos in cycle.positions:
+                self.db.save_position(cycle, pos)
         self.db.kv_set("managed_orders", self._managed_orders)
 
     # ------------------------------------------------------------------- logs
@@ -179,7 +180,7 @@ class BotRuntime:
                 timeout = self._net_timeout()
                 await asyncio.wait_for(self.broker.start(), timeout=timeout)
                 if isinstance(self.broker, PaperBroker):
-                    self.broker.restore_cycle(self.engine.cycle)
+                    self.broker.restore_cycle(self.engine.active_cycles)
                     self._managed_orders = {"add": None, "tp": None}
                     self.db.kv_set("managed_orders", self._managed_orders)
                 if self.settings.trade_mode == "live":
@@ -198,7 +199,7 @@ class BotRuntime:
                 self._chart_candles = list(history)
                 # keep the engine history but do not re-run old signals
                 self.engine.set_history(history)
-                if self.engine.cycle is None:
+                if not self.engine.active_cycles:
                     self.engine.stopped = False
                     self.engine.stop_reason = ""
                 self.paused = False
@@ -218,10 +219,10 @@ class BotRuntime:
                                  f"{self.settings.timeframe}, {movement_label}, "
                                  f"цель фибо {self.settings.fib_goal_pct:g}%, "
                                  f"мин. профит {self.settings.min_profit_pct:g}%)")
-                if self.engine.cycle:
-                    self.log("warn", f"восстановлен незакрытый цикл {self.engine.cycle.id}: "
-                                     f"{len(self.engine.cycle.positions)} поз., "
-                                     f"средняя {self.engine.cycle.avg_entry:g}, цель {self.engine.cycle.target:g}")
+                for cycle in self.engine.active_cycles:
+                    self.log("warn", f"восстановлен незакрытый цикл {cycle.id} ({cycle.side}): "
+                                     f"{len(cycle.positions)} поз., "
+                                     f"средняя {cycle.avg_entry:g}, цель {cycle.target:g}")
                 target = self.settings.total_profit_target_usd
                 if target and self.engine.realized_pnl >= target:
                     self.log("warn", f"общий профит {self.engine.realized_pnl:.2f}$ уже не меньше цели "
@@ -277,6 +278,8 @@ class BotRuntime:
 
     async def stop(self, *, reason: str = "остановлен пользователем") -> Dict[str, Any]:
         async with self._lock:
+            if self.settings.allow_opposite_cycles and self.engine.active_cycles:
+                return {"ok": False, "error": "сначала закройте активные циклы кнопкой «Закрыть всё»; параллельные paper-циклы требуют наблюдения"}
             self.paused = True
             if not await self._cancel_managed_order("add"):
                 return {"ok": False, "error": "биржа не подтвердила отмену доливочного ордера"}
@@ -315,62 +318,67 @@ class BotRuntime:
         return {"ok": True, "status": self.status}
 
     async def close_all(self, reason: str = "ручное закрытие") -> Dict[str, Any]:
-        """Panic button: close the whole active cycle at the market."""
-        cycle = self.engine.cycle
-        if cycle is None or self.broker is None:
+        """Panic button: close every active cycle at the market."""
+        if not self.engine.active_cycles or self.broker is None:
             return {"ok": False, "error": "нет открытых позиций"}
         try:
+            # Отменяем возможные заявки и в parallel mode: настройку могли включить
+            # прямо перед нажатием, пока старый TP/add ещё не был снят очередным тиком.
             if not await self._cancel_managed_order("add"):
                 return {"ok": False, "error": "биржа не подтвердила отмену доливочного ордера"}
             if not await self._cancel_managed_order("tp"):
                 return {"ok": False, "error": "биржа не подтвердила отмену TP-ордера"}
-            cycle = self.engine.cycle
-            if cycle is None:
+            if not self.engine.active_cycles:
                 return {"ok": True, "message": "TP исполнился при отмене заявки"}
             price = await self.broker.last_price() or self.engine.last_price
-            fill = await self.broker.close_position(cycle.side, cycle.total_qty, price,
-                                                    ts=now_ms(), reason=reason)
-            closed = self.engine.close_cycle(fill.price, fill.ts or now_ms(), reason, fee=fill.fee)
+            closed_cycles = []
+            for cycle in list(self.engine.active_cycles):
+                fill = await self.broker.close_position(cycle.side, cycle.total_qty, price,
+                                                        ts=now_ms(), reason=reason)
+                closed = self.engine.close_cycle(fill.price, fill.ts or now_ms(), reason,
+                                                 fee=fill.fee, cycle_id=cycle.id)
+                closed_cycles.append(closed)
+                self.db.save_cycle(closed)
+                for pos in closed.positions:
+                    self.db.save_position(closed, pos)
             self._managed_orders = {"add": None, "tp": None}
             self._persist_state()
-            self.db.save_cycle(closed)
-            for pos in closed.positions:
-                self.db.save_position(closed, pos)
-            self.log("warn", f"Все позиции закрыты вручную по {fill.price:g}: {closed.pnl:+.4f}$")
-            await self._notify(f"PlanB: ручное закрытие, результат {closed.pnl:+.4f}$")
-            return {"ok": True, "pnl": closed.pnl, "price": fill.price}
+            pnl = sum(cycle.pnl for cycle in closed_cycles)
+            self.log("warn", f"Все циклы закрыты вручную по рынку: {pnl:+.4f}$, циклов {len(closed_cycles)}")
+            await self._notify(f"PlanB: ручное закрытие всех циклов, результат {pnl:+.4f}$")
+            return {"ok": True, "pnl": pnl, "price": price, "cycles": len(closed_cycles)}
         except Exception as exc:
             self.log("error", f"не удалось закрыть позиции: {exc}")
             return {"ok": False, "error": str(exc)}
 
     async def reset_cycle(self, reason: str = "цикл сброшен вручную") -> Dict[str, Any]:
-        """Закрыть незакрытый цикл только в учёте (позиции на бирже уже нет).
-
-        Нужно, если позицию закрыли руками на бирже: записываем цикл как завершённый
-        по текущей цене, чтобы бот мог продолжить работу.
-        """
-        cycle = self.engine.cycle
-        if cycle is None:
+        """Close active cycle(s) in accounting after manual exchange closure."""
+        cycles = list(self.engine.active_cycles)
+        if not cycles:
             return {"ok": False, "error": "нет незакрытого цикла"}
         if not await self._cancel_managed_order("add"):
             return {"ok": False, "error": "биржа не подтвердила отмену доливочного ордера"}
         if not await self._cancel_managed_order("tp"):
             return {"ok": False, "error": "биржа не подтвердила отмену TP-ордера"}
-        cycle = self.engine.cycle
-        if cycle is None:
+        cycles = list(self.engine.active_cycles)
+        if not cycles:
             return {"ok": True, "message": "TP исполнился при отмене заявки"}
-        price = self.engine.last_price or cycle.avg_entry
-        closed = self.engine.close_cycle(price, now_ms(), reason)
+        price = self.engine.last_price or cycles[0].avg_entry
+        closed_cycles = []
+        for cycle in list(self.engine.active_cycles):
+            closed = self.engine.close_cycle(price, now_ms(), reason, cycle_id=cycle.id)
+            closed_cycles.append(closed)
+            self.db.save_cycle(closed)
+            for pos in closed.positions:
+                self.db.save_position(closed, pos)
         self._persist_state()
-        self.db.save_cycle(closed)
-        for pos in closed.positions:
-            self.db.save_position(closed, pos)
         self.paused = False
         if self.status == STATUS_PAUSED:
             self.status = STATUS_RUNNING
-        self.log("warn", f"Цикл {closed.id} сброшен в учёте по цене {price:g}: "
-                         f"{closed.pnl:+.4f}$ (оценка, комиссии не пересчитаны)")
-        return {"ok": True, "price": price, "pnl": closed.pnl}
+        pnl = sum(cycle.pnl for cycle in closed_cycles)
+        self.log("warn", f"Сброшено циклов: {len(closed_cycles)}, оценка результата {pnl:+.4f}$ "
+                         f"(по {price:g}; комиссии выхода не пересчитаны)")
+        return {"ok": True, "price": price, "pnl": pnl, "cycles": len(closed_cycles)}
 
     async def reset_stats(self) -> Dict[str, Any]:
         """Reset all-time counters without deleting the detailed trade history."""
@@ -413,7 +421,12 @@ class BotRuntime:
             or new_settings.timeframe != old.timeframe
             or new_settings.trade_mode != old.trade_mode
         )
-        if market_changed and self.engine.cycle is not None:
+        if (old.allow_opposite_cycles and not new_settings.allow_opposite_cycles
+                and len(self.engine.active_cycles) > 1):
+            message = "нельзя отключить встречные циклы, пока открыты обе стороны; закройте один цикл"
+            return {"ok": False, "error": message, "restarted": False,
+                    "connection_changed": False, "paused_after_restart": self.paused}
+        if market_changed and self.engine.active_cycles:
             message = ("нельзя сменить рынок, таймфрейм или режим торговли при открытом цикле: "
                        "сначала закройте позицию и отмените отложенные заявки")
             self.log("error", message)
@@ -447,7 +460,7 @@ class BotRuntime:
                              f"{new_settings.min_profit_pct:g}%")
         if was_running and connection_changed:
             await self.start(new_settings, restart=True)
-            if market_changed and self.engine.cycle is not None:
+            if market_changed and self.engine.active_cycles:
                 # рынок изменился, а цикл открыт: не торгуем автоматически на новом
                 # рынке, пока пользователь не проверит позиции
                 self.paused = True
@@ -455,6 +468,9 @@ class BotRuntime:
                 self.log("warn", "изменён рынок/символ/таймфрейм/режим торговли, но остался "
                                  "незакрытый цикл — бот на паузе. Проверьте позиции и нажмите "
                                  "«Продолжить» либо «Закрыть всё»/«Сбросить цикл».")
+        elif was_running and new_settings.allow_opposite_cycles != old.allow_opposite_cycles:
+            # При смене режима сразу убрать прежние managed orders, не ждать следующего тика.
+            await self._sync_cycle_orders()
         return {"ok": True, "restarted": bool(was_running and connection_changed),
                 "connection_changed": connection_changed, "paused_after_restart": self.paused}
 
@@ -610,21 +626,21 @@ class BotRuntime:
         return {"ok": True, **scan}
 
     def _track_cycle_exposure(self, mark_price: float) -> None:
-        cycle = self.engine.cycle
-        if cycle is None or mark_price <= 0:
+        if mark_price <= 0:
             return
-        notional = sum(p.qty * mark_price for p in cycle.open_positions)
         is_futures = self.settings.market_type == "futures"
         leverage = max(1.0, float(self.settings.leverage or 1.0))
-        margin = notional / leverage if is_futures else notional
-        cycle.peak_notional_usd = max(cycle.peak_notional_usd, notional)
-        cycle.peak_margin_usd = max(cycle.peak_margin_usd, margin)
         try:
             equity = float((self.balance or {}).get("total") or 0)
         except (TypeError, ValueError):
             equity = 0.0
-        if equity > 0:
-            cycle.max_deposit_load_pct = max(cycle.max_deposit_load_pct, margin / equity * 100.0)
+        for cycle in self.engine.active_cycles:
+            notional = sum(p.qty * mark_price for p in cycle.open_positions)
+            margin = notional / leverage if is_futures else notional
+            cycle.peak_notional_usd = max(cycle.peak_notional_usd, notional)
+            cycle.peak_margin_usd = max(cycle.peak_margin_usd, margin)
+            if equity > 0:
+                cycle.max_deposit_load_pct = max(cycle.max_deposit_load_pct, margin / equity * 100.0)
 
     async def _refresh_account(self) -> None:
         if self.settings.synthetic_data and self.engine.last_price > 0:
@@ -642,7 +658,7 @@ class BotRuntime:
         """Compare our idea of the position with the exchange one (live mode)."""
         if self.broker is None or self.settings.trade_mode != "live":
             return
-        cycle = self.engine.cycle
+        cycles = self.engine.active_cycles
         total = 0.0
         for side in ("long", "short"):
             try:
@@ -650,7 +666,7 @@ class BotRuntime:
             except Exception:
                 return
         self.exchange_position = total
-        expected = cycle.total_qty if cycle else 0.0
+        expected = sum(cycle.total_qty for cycle in cycles)
         if expected and total and abs(total - expected) / expected > 0.05:
             self.log("warn", f"размер позиции на бирже ({total:g}) не совпадает с расчётным ({expected:g})")
         elif expected and not total:
@@ -673,17 +689,16 @@ class BotRuntime:
             return
         for action in actions:
             try:
-                if action.kind == "add":
-                    # Усреднения теперь заранее выставляются как биржевые limit-ордера;
-                    # action служит резервным сигналом для пересчёта плана, не market-заявкой.
+                if action.kind == "add" and not self.settings.allow_opposite_cycles:
+                    # В обычном режиме доливы ведутся отложенным limit-ордером.
                     continue
-                if action.kind == "entry":
+                if action.kind in ("entry", "add"):
                     if self.paused:
                         continue
                     fill = await self.broker.open_position(action.side, action.volume_usd,
                                                            action.ref_price, action.ts)
                     self.engine.apply_fill(action, fill)
-                    cycle = self.engine.cycle
+                    cycle = self.engine.get_cycle(action.cycle_id, side=action.side)
                     self._persist_state()
                     if cycle:
                         self.db.save_cycle(cycle)
@@ -702,31 +717,32 @@ class BotRuntime:
                                       f"{action.reason}.{extra}")
                     await self._notify(f"PlanB: {kind} {action.side} {fill.price:g}.{extra}")
                 elif action.kind == "close_all":
-                    cycle = self.engine.cycle
+                    cycle = self.engine.get_cycle(action.cycle_id, side=action.side)
                     if cycle is None:
                         continue
-                    if action.reason != "стоп-лосс":
+                    if action.reason != "стоп-лосс" and not self.settings.allow_opposite_cycles:
                         # Take-profit исполняется выставленной заранее лимитной заявкой;
                         # не дублируем её market-закрытием по следующему тiku.
                         self.log("info", f"цель {cycle.target:g} затронута — ожидаю исполнения "
                                           f"лимитного TP-ордера")
                         continue
-                    if not await self._cancel_managed_order("add"):
-                        self.paused = True
-                        self.status = STATUS_PAUSED
-                        continue
-                    if not await self._cancel_managed_order("tp"):
-                        self.paused = True
-                        self.status = STATUS_PAUSED
-                        continue
-                    cycle = self.engine.cycle
+                    if not self.settings.allow_opposite_cycles:
+                        if not await self._cancel_managed_order("add"):
+                            self.paused = True
+                            self.status = STATUS_PAUSED
+                            continue
+                        if not await self._cancel_managed_order("tp"):
+                            self.paused = True
+                            self.status = STATUS_PAUSED
+                            continue
+                    cycle = self.engine.get_cycle(action.cycle_id, side=action.side)
                     if cycle is None:
                         continue
                     fill = await self.broker.close_position(cycle.side, cycle.total_qty,
                                                             action.ref_price, action.ts,
                                                             reason=action.reason)
                     closed = self.engine.close_cycle(fill.price, fill.ts or now_ms(),
-                                                     action.reason, fee=fill.fee)
+                                                     action.reason, fee=fill.fee, cycle_id=cycle.id)
                     self._persist_state()
                     self.db.save_cycle(closed)
                     for pos in closed.positions:
@@ -741,11 +757,16 @@ class BotRuntime:
                                        f"{self.engine.realized_pnl:+.4f}$")
                     await self._refresh_account()
             except BrokerError as exc:
-                if action.kind == "entry" and self.engine.cycle and not self.engine.cycle.positions:
-                    self.engine.cycle = None
+                cycle = self.engine.get_cycle(action.cycle_id, side=action.side)
+                if action.kind == "entry" and cycle is not None and not cycle.positions:
+                    self.engine.discard_empty_cycle(cycle.id)
                     self._persist_state()
                 self.log("error", f"ошибка исполнения ({action.kind}): {exc}")
             except Exception as exc:  # pragma: no cover
+                cycle = self.engine.get_cycle(action.cycle_id, side=action.side)
+                if action.kind == "entry" and cycle is not None and not cycle.positions:
+                    self.engine.discard_empty_cycle(cycle.id)
+                    self._persist_state()
                 self.log("error", f"непредвиденная ошибка исполнения: {exc}")
         if self.broker is not None:
             await self._sync_cycle_orders()
@@ -775,6 +796,10 @@ class BotRuntime:
 
     async def _poll_managed_orders(self) -> None:
         if self.broker is None:
+            return
+        if self.settings.allow_opposite_cycles:
+            for role in ("add", "tp"):
+                await self._cancel_managed_order(role)
             return
         # Долив сначала: если долив и TP успели исполниться между опросами,
         # закрытие будет рассчитано уже на полный фактический объём позиции.
@@ -879,8 +904,12 @@ class BotRuntime:
         await self._refresh_account()
 
     async def _sync_cycle_orders(self) -> None:
-        """Поддерживать на брокере следующий averaging limit и TP всего цикла."""
+        """Поддерживать необходимые отложенные ордера для стандартного одиночного цикла."""
         if self.broker is None:
+            return
+        if self.settings.allow_opposite_cycles:
+            for role in ("add", "tp"):
+                await self._cancel_managed_order(role)
             return
         cycle = self.engine.cycle
         if cycle is None or cycle.total_qty <= 0:
@@ -974,8 +1003,8 @@ class BotRuntime:
                 "levels": [{"level": cycle.goal_pct, "price": cycle.target, "label": "цель"}],
             }
         mark = self.engine.last_price
-        cycle_notional = (sum(p.qty * mark for p in cycle.open_positions)
-                          if cycle is not None and mark > 0 else 0.0)
+        cycle_notional = (sum(p.qty * mark for c in self.engine.active_cycles for p in c.open_positions)
+                          if mark > 0 else 0.0)
         is_futures = self.settings.market_type == "futures"
         leverage = max(1.0, float(self.settings.leverage or 1.0))
         estimated_margin = cycle_notional / leverage if is_futures else cycle_notional
@@ -988,6 +1017,7 @@ class BotRuntime:
             "free_balance": (self.balance or {}).get("free"),
             "exchange_used": (self.balance or {}).get("used"),
             "cycle_notional": cycle_notional,
+            "active_cycles": len(self.engine.active_cycles),
             "estimated_margin": estimated_margin,
             "deposit_load_pct": estimated_margin / account_total * 100 if account_total > 0 else None,
             "leverage": leverage if is_futures else 1.0,
@@ -1046,11 +1076,12 @@ class BotRuntime:
                 for lv in fib_grid(cycle.swing_low, cycle.swing_high,
                                    move_side=cycle.move_side)
             ]
-            for pos in cycle.positions:
+        for active_cycle in self.engine.active_cycles:
+            for pos in active_cycle.positions:
                 mult = pos.multiplier
                 label = f"{pos.idx}" + (f" x{mult:g}" if mult > 1 else "")
                 markers.append({"ts": pos.ts, "price": pos.price, "text": label,
-                                "kind": "entry", "side": cycle.side})
+                                "kind": "entry", "side": active_cycle.side})
         for c in self.engine.closed_cycles[-40:]:
             for pos in c.positions:
                 markers.append({"ts": pos.ts, "price": pos.price,
@@ -1090,6 +1121,9 @@ class BotRuntime:
         for key, value in (params or {}).items():
             if key in merged and value is not None:
                 merged[key] = value
+        # A backtest always uses virtual execution regardless of the runtime's
+        # current paper/live setting; no exchange orders are ever sent here.
+        merged["trade_mode"] = "paper"
         return BotSettings(**merged)
 
     def _backtest_request(self, bt_settings: BotSettings, params: Dict[str, Any]) -> HistoryRequest:

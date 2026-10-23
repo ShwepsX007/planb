@@ -51,6 +51,8 @@ class StrategyEngine:
                  realized_pnl: float = 0.0, wins: int = 0, losses: int = 0) -> None:
         self.settings = settings
         self.cycle: Optional[Cycle] = None
+        self.other_cycle: Optional[Cycle] = None
+        self._stop_when_flat = False
         self.candles: List[Candle] = []
         self.last_price: float = 0.0
         self.realized_pnl: float = float(realized_pnl)
@@ -72,6 +74,36 @@ class StrategyEngine:
         self._tick_candle: Optional[Candle] = None
         #: Не открываем повторно тот же сигнал после закрытия цикла.
         self._consumed_signals: set[tuple] = set()
+
+    @property
+    def active_cycles(self) -> List[Cycle]:
+        return [cycle for cycle in (self.cycle, self.other_cycle) if cycle is not None]
+
+    def get_cycle(self, cycle_id: Optional[str] = None, *, side: Optional[str] = None) -> Optional[Cycle]:
+        for cycle in self.active_cycles:
+            if (cycle_id is None or cycle.id == cycle_id) and (side is None or cycle.side == side):
+                return cycle
+        return None
+
+    def _attach_cycle(self, cycle: Cycle) -> None:
+        if self.cycle is None:
+            self.cycle = cycle
+        elif self.other_cycle is None:
+            self.other_cycle = cycle
+        else:
+            raise RuntimeError("достигнут лимит двух встречных циклов")
+
+    def _detach_cycle(self, cycle: Cycle) -> None:
+        if self.cycle is cycle:
+            self.cycle = self.other_cycle
+            self.other_cycle = None
+        elif self.other_cycle is cycle:
+            self.other_cycle = None
+
+    def discard_empty_cycle(self, cycle_id: str) -> None:
+        cycle = self.get_cycle(cycle_id)
+        if cycle is not None and not cycle.positions:
+            self._detach_cycle(cycle)
 
     # ------------------------------------------------------------------ feeding
     def set_history(self, candles: Sequence[Candle]) -> None:
@@ -107,27 +139,60 @@ class StrategyEngine:
         if self.stopped:
             return []
 
-        if self.cycle is None:
-            signal_candles = list(self.candles)
-            if signal_candles and signal_candles[-1].ts == live.ts:
-                signal_candles[-1] = live
-            elif not signal_candles or live.ts > signal_candles[-1].ts:
-                signal_candles.append(live)
-            impulse, reason = detect_signal(signal_candles, self.settings)
-            self.last_check = reason
+        if not self.settings.allow_opposite_cycles:
+            if self.cycle is None:
+                signal_candles = self._signal_candles(live)
+                impulse, reason = detect_signal(signal_candles, self.settings)
+                self.last_check = reason
+                if impulse is None:
+                    return []
+                token = self._signal_token(impulse)
+                if token in self._consumed_signals:
+                    return []
+                self._consumed_signals.add(token)
+                self.signals_found += 1
+                return [self._open_cycle(impulse, live, action_ts=now_ms())]
+            return self._tick_cycle(self.cycle, price, live)
+
+        actions: List[Action] = []
+        for cycle in list(self.active_cycles):
+            actions.extend(self._tick_cycle(cycle, price, live))
+        if not self._stop_when_flat and len(self.active_cycles) < 2:
+            signal_candles = self._signal_candles(live)
+            actions.extend(self._open_missing_side(signal_candles, live, action_ts=now_ms()))
+        return actions
+
+    def _signal_candles(self, live: Candle) -> List[Candle]:
+        signal_candles = list(self.candles)
+        if signal_candles and signal_candles[-1].ts == live.ts:
+            signal_candles[-1] = live
+        elif not signal_candles or live.ts > signal_candles[-1].ts:
+            signal_candles.append(live)
+        return signal_candles
+
+    def _open_missing_side(self, signal_candles: Sequence[Candle], candle: Candle,
+                           *, action_ts: int) -> List[Action]:
+        actions: List[Action] = []
+        allowed = self.settings.allowed_sides()
+        for side in allowed:
+            if self.get_cycle(side=side) is not None:
+                continue
+            side_settings = self.settings.model_copy(update={"direction": side})
+            impulse, reason = detect_signal(signal_candles, side_settings)
             if impulse is None:
-                return []
+                self.last_check = reason
+                continue
             token = self._signal_token(impulse)
             if token in self._consumed_signals:
-                return []
+                continue
             self._consumed_signals.add(token)
             self.signals_found += 1
-            return [self._open_cycle(impulse, live, action_ts=now_ms())]
+            actions.append(self._open_cycle(impulse, candle, action_ts=action_ts))
+        return actions
 
-        cycle = self.cycle
-        # For a candle that began after entry, its completed/live adverse extreme
-        # belongs to the open cycle. On the entry candle use only observed ticks:
-        # the candle's earlier wick may predate the fill.
+    def _tick_cycle(self, cycle: Cycle, price: float, live: Candle) -> List[Action]:
+        # For a candle that began after entry, its adverse extreme belongs to the
+        # cycle. On its entry candle use observed ticks only, avoiding stale wicks.
         if live.ts > cycle.risk_candle_ts:
             adverse = live.low if cycle.side == "long" else live.high
             self._record_cycle_adverse(cycle, adverse)
@@ -135,14 +200,12 @@ class StrategyEngine:
         else:
             self._record_cycle_adverse(cycle, price)
         self._update_cycle_grid(cycle, price, live)
-        target_touched_in_profit = ((price >= cycle.target and price > cycle.avg_entry)
-                                    if cycle.side == "long" else
-                                    (price <= cycle.target and price < cycle.avg_entry))
+        target_touched = ((price >= cycle.target and price > cycle.avg_entry)
+                          if cycle.side == "long" else
+                          (price <= cycle.target and price < cycle.avg_entry))
         actions = self._exit_checks(cycle, high=price, low=price, open_price=price,
                                     ts=now_ms(), close_price=price)
-        if actions or target_touched_in_profit:
-            # Если цель уже затронута, но минимум профита ещё не набран, сохраняем
-            # сообщение _exit_checks и не подменяем его сообщением о готовом доливе.
+        if actions or target_touched:
             return actions
         return self._tick_add(cycle, price, now_ms())
 
@@ -180,6 +243,15 @@ class StrategyEngine:
         if self.stopped:
             return []
 
+        if self.settings.allow_opposite_cycles:
+            actions: List[Action] = []
+            for cycle in list(self.active_cycles):
+                actions.extend(self._manage(cycle, candle))
+            if (not self._stop_when_flat and len(self.active_cycles) < 2
+                    and not any(action.kind == "close_all" for action in actions)):
+                actions.extend(self._open_missing_side(self.candles, candle, action_ts=candle.ts))
+            return actions
+
         if self.cycle is None:
             impulse, reason = detect_signal(self.candles, self.settings)
             self.last_check = reason
@@ -211,14 +283,15 @@ class StrategyEngine:
         cycle.target = retrace_price(cycle.swing_low, cycle.swing_high,
                                      cycle.move_side, cycle.goal_pct)
 
-    def next_add_plan(self, current_price: float = 0.0) -> Optional[Dict[str, Any]]:
+    def next_add_plan(self, current_price: float = 0.0,
+                      cycle_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """Рассчитать лимитный уровень следующего усреднения.
 
         Уровень выводится из условия стратегии: расстояние от средней позиции до
         обновляемой цели Фибо становится не больше ``min_profit_pct``. Это дает
         заранее видимую цену заявки, а не сигнал, возникающий только после касания.
         """
-        cycle = self.cycle
+        cycle = self.get_cycle(cycle_id)
         s = self.settings
         if cycle is None or not cycle.positions or len(cycle.positions) >= s.max_positions:
             return None
@@ -271,7 +344,7 @@ class StrategyEngine:
                            volume_usd=volume, position_idx=idx, target=cycle.target,
                            reason=(f"профит до цели {profit_pct:.3f}% <= минимума "
                                    f"{s.min_profit_pct:g}% (долив по текущей цене)"),
-                           ts=ts)]
+                           ts=ts, cycle_id=cycle.id)]
         if profit_pct <= s.min_profit_pct + 1e-9 and not guard_ok:
             edge = "минимум" if cycle.side == "long" else "максимум"
             self.last_check = (f"профит до цели {profit_pct:.2f}% <= {s.min_profit_pct:g}%, "
@@ -301,7 +374,7 @@ class StrategyEngine:
                   f"[{impulse.low:g}..{impulse.high:g}]"
                   + (f", коррекция {impulse.correction_pct:.1f}%" if impulse.mode == "swing" else "")),
         )
-        self.cycle = cycle
+        self._attach_cycle(cycle)
         volume = s.volume_for_position(1)
         return Action(
             kind="entry",
@@ -312,6 +385,7 @@ class StrategyEngine:
             target=cycle.target,
             reason=f"сигнал: {impulse.candles} свечей {impulse.move_side} {impulse.move_pct:.2f}%",
             ts=action_ts if action_ts is not None else candle.ts,
+            cycle_id=cycle.id,
         )
 
     @staticmethod
@@ -392,7 +466,7 @@ class StrategyEngine:
                     reason=(f"профит до цели {profit_pct:.3f}% <= минимума "
                             f"{s.min_profit_pct:g}% (средняя {avg:g}, после долива "
                             f"{new_avg:g}, профит {profit_after:.3f}%)"),
-                    ts=candle.ts,
+                    ts=candle.ts, cycle_id=cycle.id,
                 )]
             if profit_pct <= s.min_profit_pct + 1e-9 and not guard_ok:
                 self.last_check = (f"ждём новый экстремум для долива #{len(cycle.positions) + 1} "
@@ -423,7 +497,7 @@ class StrategyEngine:
                       ((price_for_sl - avg) / avg * 100.0)
             if adverse >= s.cycle_stop_loss_pct:
                 return [Action(kind="close_all", side=cycle.side, ref_price=price_for_sl,
-                               qty=cycle.total_qty, reason="стоп-лосс", ts=ts)]
+                               qty=cycle.total_qty, reason="стоп-лосс", ts=ts, cycle_id=cycle.id)]
 
         # 1. Дошла ли цена до цели в этом такте/свече?
         target_touched = (high >= target) if long else (low <= target)
@@ -458,7 +532,7 @@ class StrategyEngine:
                       + (f" (цена {best:g}, лучше цели)" if (
                           best > target if long else best < target) else ""))
             return [Action(kind="close_all", side=cycle.side, ref_price=best,
-                           qty=cycle.total_qty, reason=reason, ts=ts)]
+                           qty=cycle.total_qty, reason=reason, ts=ts, cycle_id=cycle.id)]
 
         # цель достигнута, но профита пока мало — говорим об этом пользователю,
         # а не молчим: именно это выглядело как «сделка висит»
@@ -506,7 +580,7 @@ class StrategyEngine:
 
     # ------------------------------------------------------------------- fills
     def apply_fill(self, action: Action, fill: Fill) -> Position:
-        cycle = self.cycle
+        cycle = self.get_cycle(action.cycle_id, side=action.side)
         if cycle is None:
             raise RuntimeError("нет активного цикла")
         if action.kind == "entry":
@@ -540,9 +614,9 @@ class StrategyEngine:
         return pos
 
     def close_cycle(self, price: float, ts: int, reason: str, *, qty: Optional[float] = None,
-                    fee: Optional[float] = None) -> Cycle:
-        """Close every open position of the active cycle at ``price``."""
-        cycle = self.cycle
+                    fee: Optional[float] = None, cycle_id: Optional[str] = None) -> Cycle:
+        """Close every open position in the selected active cycle."""
+        cycle = self.get_cycle(cycle_id)
         if cycle is None:
             raise RuntimeError("нет активного цикла")
         total_qty = cycle.total_qty
@@ -551,7 +625,7 @@ class StrategyEngine:
             cycle.closed_ts = ts
             cycle.close_price = price
             cycle.close_reason = reason
-            self.cycle = None
+            self._detach_cycle(cycle)
             return cycle
         if fee is None:
             fee = price * total_qty * self.settings.fee_pct / 100.0
@@ -585,15 +659,24 @@ class StrategyEngine:
         self.closed_cycles.append(cycle)
         if len(self.closed_cycles) > 200:
             self.closed_cycles = self.closed_cycles[-200:]
-        self.cycle = None
+        self._detach_cycle(cycle)
         self.last_check = f"цикл закрыт: {reason}, результат {pnl_net:+.4f}$"
 
+        stop_reason = ""
         if reason == "стоп-лосс":
-            self.stop("стоп-лосс по циклу")
+            stop_reason = "стоп-лосс по циклу"
         elif (self.settings.stop_after_total_target and self.settings.total_profit_target_usd > 0
               and self.realized_pnl >= self.settings.total_profit_target_usd):
-            self.stop(f"достигнут общий профит {self.realized_pnl:.2f}$ "
-                      f">= {self.settings.total_profit_target_usd:g}$")
+            stop_reason = (f"достигнут общий профит {self.realized_pnl:.2f}$ "
+                           f">= {self.settings.total_profit_target_usd:g}$")
+        if stop_reason:
+            self._stop_when_flat = True
+            if not self.active_cycles:
+                self.stop(stop_reason)
+            else:
+                self.stop_reason = stop_reason
+        elif self._stop_when_flat and not self.active_cycles:
+            self.stop(self.stop_reason or "все циклы завершены")
         return cycle
 
     # -------------------------------------------------------------------- misc
@@ -605,10 +688,29 @@ class StrategyEngine:
     def resume(self) -> None:
         self.stopped = False
         self.stop_reason = ""
+        self._stop_when_flat = False
+
+    def _cycle_state(self, cycle: Cycle) -> Dict[str, Any]:
+        avg = cycle.avg_entry
+        s = self.settings
+        next_idx = len(cycle.positions) + 1
+        return {
+            **cycle.dict(),
+            "profit_pct_to_target": round(cycle.profit_pct_to(cycle.target), 4),
+            "unrealized_pnl": round(cycle.unrealized_pnl(self.last_price or avg), 6),
+            "expected_pnl_at_target": round(cycle.expected_pnl_at_target(s.fee_pct), 6),
+            "next_position_idx": next_idx if next_idx <= s.max_positions else None,
+            "next_position_volume_usd": (s.volume_for_position(next_idx)
+                                         if next_idx <= s.max_positions else None),
+            "positions_left": max(0, s.max_positions - len(cycle.positions)),
+            "distance_to_target_pct": round(
+                (cycle.target / self.last_price - 1) * 100 if cycle.side == "long" and self.last_price
+                else (1 - cycle.target / self.last_price) * 100 if self.last_price else 0.0, 4),
+        }
 
     def state(self) -> Dict[str, Any]:
-        cycle = self.cycle
-        out: Dict[str, Any] = {
+        cycles = [self._cycle_state(cycle) for cycle in self.active_cycles]
+        return {
             "stopped": self.stopped,
             "stop_reason": self.stop_reason,
             "last_check": self.last_check,
@@ -621,32 +723,18 @@ class StrategyEngine:
             "losses": self.losses,
             "signals_found": self.signals_found,
             "win_rate": round(self.wins / self.cycles_total * 100, 2) if self.cycles_total else 0.0,
-            "cycle": None,
+            "cycle": cycles[0] if cycles else None,
+            "cycles": cycles,
+            "unrealized_pnl": round(sum(cycle["unrealized_pnl"] for cycle in cycles), 6),
         }
-        if cycle is not None:
-            avg = cycle.avg_entry
-            s = self.settings
-            next_idx = len(cycle.positions) + 1
-            out["cycle"] = {
-                **cycle.dict(),
-                "profit_pct_to_target": round(cycle.profit_pct_to(cycle.target), 4),
-                "unrealized_pnl": round(cycle.unrealized_pnl(self.last_price or avg), 6),
-                "expected_pnl_at_target": round(cycle.expected_pnl_at_target(s.fee_pct), 6),
-                "next_position_idx": next_idx if next_idx <= s.max_positions else None,
-                "next_position_volume_usd": (s.volume_for_position(next_idx)
-                                             if next_idx <= s.max_positions else None),
-                "positions_left": max(0, s.max_positions - len(cycle.positions)),
-                "distance_to_target_pct": round(
-                    (cycle.target / self.last_price - 1) * 100 if cycle.side == "long" and self.last_price
-                    else (1 - cycle.target / self.last_price) * 100 if self.last_price else 0.0, 4),
-            }
-        return out
 
     def snapshot(self) -> Dict[str, Any]:
         """Serializable engine state, used for restart recovery."""
+        cycles_raw = [self._cycle_raw(cycle) for cycle in self.active_cycles]
         return {
             "cycle": self.cycle.dict() if self.cycle else None,
             "cycle_raw": self._cycle_raw(self.cycle) if self.cycle else None,
+            "cycles_raw": cycles_raw,
             "realized_pnl": self.realized_pnl,
             "cycles_total": self.cycles_total,
             "wins": self.wins,
@@ -683,8 +771,13 @@ class StrategyEngine:
     def restore(self, raw: Optional[dict]) -> None:
         if not raw:
             return
+        if isinstance(raw, list):
+            self.cycle = self.other_cycle = None
+            for item in raw[:2]:
+                self.restore(item)
+            return
         positions = [Position(**p) for p in raw.get("positions", [])]
-        self.cycle = Cycle(
+        restored_cycle = Cycle(
             id=raw.get("id", uuid.uuid4().hex[:12]),
             side=raw.get("side", "long"),
             signal_ts=raw.get("signal_ts", 0),
@@ -712,6 +805,7 @@ class StrategyEngine:
             peak_margin_usd=raw.get("peak_margin_usd", 0.0),
             max_deposit_load_pct=raw.get("max_deposit_load_pct", 0.0),
         )
+        self._attach_cycle(restored_cycle)
 
 # ------------------------------------------------------------------ диагностика
 def scan_signals(candles: Sequence[Candle], settings, *, sample: int = 5) -> Dict[str, Any]:

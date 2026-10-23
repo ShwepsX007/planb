@@ -59,7 +59,7 @@ const snapshot = {
   price: 59500.5, balance: { mode: 'paper', total: 1005.25, free: 1005.25, used: 160, start_balance: 1000 },
   account_metrics: { total_balance: 1005.25, free_balance: 1005.25, exchange_used: 160,
     cycle_notional: 77.35, estimated_margin: 15.47, deposit_load_pct: 1.539,
-    leverage: 5, margin_basis: 'оценка: номинал / плечо' },
+    active_cycles: 2, leverage: 5, margin_basis: 'оценка: номинал / плечо' },
   exchange_position: 0, grid: null, target_total_profit: 50,
   stats_24h: { pnl: 1.25, cycles: 2, wins: 1, losses: 1, reset_at: null, window_hours: 24 },
   pending_orders: [{ role: 'add', idx: 4, price: 58800, volume_usd: 40, qty: 0.00068, status: 'open' }],
@@ -87,6 +87,11 @@ const snapshot = {
     },
   },
 };
+snapshot.engine.cycles = [snapshot.engine.cycle, {
+  ...snapshot.engine.cycle, id: 'short-cycle-2', side: 'short', swing_high: 61000,
+  swing_low: 59000, target: 60000, avg_entry: 60500, unrealized_pnl: -0.25,
+  positions: [{ ...snapshot.engine.cycle.positions[0], idx: 1, price: 60500, qty: 0.0002 }],
+}];
 
 const settings = {
   timeframe: '5m', timeframes: ['1m','5m','15m','1h'], candles_count: 3, min_move_pct: 1.2,
@@ -118,6 +123,8 @@ const btFiles = { ok: true, files: [
 const btResult = {
   ok: true, id: 7, candles: 8640, from_ts: Date.now() - 86400000, to_ts: Date.now(),
   initial_balance: 1000, final_equity: 1012.5, total_pnl: 12.5, return_pct: 1.25,
+  leverage: 5, direction: 'both', allow_opposite_cycles: true, margin_rejections: 1,
+  busted: false, bust_ts: null,
   cycles: 4, wins: 3, losses: 1, win_rate: 75, avg_cycle_pnl: 3.1, best_cycle: 6.4,
   worst_cycle: -1.2, profit_factor: 4.1, fees_total: 1.7, max_drawdown: 4.2,
   max_drawdown_pct: 0.42, peak_notional_exposure: 180, max_margin_used_estimate: 36,
@@ -249,6 +256,14 @@ setTimeout(async () => {
   check('подсказка цели знает, где 0 сетки',
     $('cTargetHint').textContent.includes('0 снизу'), $('cTargetHint').textContent);
   check('в бэктесте можно выбрать метод входа', !!$('bt_entry_mode') && $('bt_entry_mode').value === 'swing');
+  check('в бэктесте доступны направление, плечо и встречные циклы',
+    !!$('bt_direction') && !!$('bt_leverage') && !!$('bt_allow_opposite_cycles'));
+  $('bt_allow_opposite_cycles').checked = true;
+  const tradeParams = window.collectBacktestParams();
+  check('параметры бэктеста отправляют направление, плечо и встречный режим',
+    tradeParams.direction === 'both' && tradeParams.leverage === 5
+      && tradeParams.allow_opposite_cycles === true);
+  $('bt_allow_opposite_cycles').checked = false;
   check('в бэктесте фиксированное N скрыто для swing',
     $('bt_candles_count').closest('.field').classList.contains('hidden'));
   $('bt_entry_mode').value = 'impulse';
@@ -299,11 +314,18 @@ setTimeout(async () => {
   check('статистика за сутки отображает P/L и циклы', text('cDailyPnl').includes('1.2500')
     && text('cDailySummary').includes('циклов 2'), `${text('cDailyPnl')} · ${text('cDailySummary')}`);
   check('средняя входа', text('cAvg').replace(/\s/g, '').startsWith('59'), text('cAvg'));
+  check('подсказка средней входа показывает число активных циклов',
+    text('cAvgHint').includes('циклов 2'), text('cAvgHint'));
+  check('account metrics показывают количество активных циклов',
+    $('engineBox').textContent.includes('Активные циклы')
+      && $('engineBox').textContent.includes('Активные циклы2'));
   check('цель', text('cTarget').replace(/\s/g, '').startsWith('59'), text('cTarget'));
   check('профит до цели', text('cProfitToTarget').includes('0.508'), text('cProfitToTarget'));
   check('следующий долив', text('cNextAdd').replace(',', '.').includes('40.00'), text('cNextAdd'));
-  check('таблица позиций цикла заполнена', window.document.querySelectorAll('#currentPositions tbody tr').length === 3,
+  check('таблица позиций всех активных циклов заполнена', window.document.querySelectorAll('#currentPositions tbody tr').length === 4,
     window.document.querySelectorAll('#currentPositions tbody tr').length + ' строк');
+  check('позиция встречного цикла показывает сторону SHORT',
+    window.document.querySelector('#currentPositions tbody').textContent.includes('Шорт'));
   check('множитель x2 показан', window.document.querySelector('#currentPositions tbody').textContent.includes('x2'));
   check('в текущем цикле показаны маржа и максимальный неблагоприятный P/L',
     $('engineBox').textContent.includes('Оценка требуемой маржи')
@@ -311,7 +333,8 @@ setTimeout(async () => {
   check('активная позиция показывает длительность и текущий номинал',
     $('currentPositions').textContent.includes('Текущий номинал')
       && $('currentPositions').textContent.includes('В позиции'));
-  check('блок текущего цикла', $('cycleBox').textContent.includes('abc123'));
+  check('блок текущих циклов показывает обе стороны',
+    $('cycleBox').textContent.includes('abc123') && $('cycleBox').textContent.includes('short-cycle-2'));
   check('журнал', $('logs').textContent.includes('Вход long'));
   check('история циклов', window.document.querySelectorAll('#cyclesTable tbody tr').length === 1);
   check('история показывает время, максимальную нагрузку и MAE',
@@ -365,6 +388,10 @@ setTimeout(async () => {
   check('в бэктесте показаны сделки по позициям и расчёт нагрузки',
     window.document.querySelectorAll('#btPositions tbody tr').length === 1
       && $('btStats').textContent.includes('Пик маржи / нагрузка'));
+  check('в итогах бэктеста показаны направление, плечо и отклонённые входы',
+    $('btStats').textContent.includes('LONG + SHORT')
+      && $('btStats').textContent.includes('плечо 5x')
+      && $('btStats').textContent.includes('Входы без маржи'));
   check('построена история нагрузки депозита', chartCount >= 4, `создано графиков: ${chartCount}`);
   check('сказано, что история реальная', $('btDataInfo').textContent.includes('Реальная история Gate.io'),
     $('btDataInfo').textContent);
@@ -427,6 +454,8 @@ setTimeout(async () => {
   // «бот молчит»: свечи идут, входов нет — панель обязана объяснить причину цифрами
   const silent = JSON.parse(JSON.stringify(snapshot));
   silent.engine.cycle = null;
+  silent.engine.cycles = [];
+  silent.account_metrics.active_cycles = 0;
   silent.engine.last_check = 'движение 0.31% < порога 0.6%';
   silent.price = 81234.5;
   // приходит так же, как с сервера: сообщением WebSocket

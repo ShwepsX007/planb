@@ -56,6 +56,7 @@ class BotSettings(BaseModel):
     fib_goal_pct: float = Field(default=50.0, gt=0, le=618, description="цель, уровень коррекции по фибо, %")
     min_profit_pct: float = Field(default=0.5, gt=0, le=100, description="минимальный % профита")
     direction: Literal["both", "long", "short"] = "both"
+    allow_opposite_cycles: bool = False
     move_measure: Literal["range", "close"] = "range"
     candle_direction_mode: Literal["body", "close"] = "body"
     update_swing_in_cycle: bool = False   # тянуть сетку также по новым максимумам
@@ -147,6 +148,12 @@ class BotSettings(BaseModel):
             self.swing_lookback = self.candles_count * 2
         if self.market_type == "spot" and self.direction == "short":
             self.direction = "long"
+        if self.allow_opposite_cycles and self.market_type != "futures":
+            raise ValueError("одновременные противоположные циклы доступны только на фьючерсах")
+        if self.allow_opposite_cycles and self.trade_mode == "live":
+            raise ValueError(
+                "одновременные противоположные циклы доступны только в paper и бэктесте; "
+                "live требует подтверждённый hedge-mode на Gate.io")
         if self.trade_mode == "live" and self.synthetic_data:
             raise ValueError(
                 "нельзя торговать реальными деньгами (live) на выдуманных свечах: выберите "

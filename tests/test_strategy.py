@@ -8,7 +8,7 @@ from __future__ import annotations
 import pytest
 
 from app.config import BotSettings
-from app.fib import detect_impulse, fib_level, fib_grid
+from app.fib import Impulse, detect_impulse, fib_level, fib_grid
 from app.models import Candle, Fill
 from app.strategy import StrategyEngine
 
@@ -352,3 +352,36 @@ def test_state_snapshot_roundtrip():
     assert other.cycle.target == pytest.approx(engine.cycle.target)
     assert other.cycle.side == "long"
     assert other.cycle.positions[0].qty == pytest.approx(engine.cycle.positions[0].qty)
+
+
+def test_opposite_cycles_are_independent(monkeypatch):
+    import app.strategy as strategy_module
+
+    s = settings(direction="both", market_type="futures", trade_mode="paper",
+                 allow_opposite_cycles=True)
+
+    def both_signals(candles, side_settings):
+        side = side_settings.direction
+        return Impulse(
+            side=side, move_side="down" if side == "long" else "up",
+            high=105.0, low=95.0, entry_price=100.0, target=100.0,
+            move_pct=10.0, candles=3, start_ts=1, end_ts=2,
+        ), "signal"
+
+    monkeypatch.setattr(strategy_module, "detect_signal", both_signals)
+    engine = StrategyEngine(s)
+    actions = engine.on_candle(candle(300_000, 100, 101, 99, 100))
+    assert [action.side for action in actions] == ["long", "short"]
+    assert len({action.cycle_id for action in actions}) == 2
+
+    for action in actions:
+        engine.apply_fill(action, Fill(price=100.0, qty=1.0, ts=action.ts))
+    assert {cycle.side for cycle in engine.active_cycles} == {"long", "short"}
+
+    short = engine.get_cycle(side="short")
+    engine.close_cycle(90.0, 400_000, "test short", cycle_id=short.id)
+    assert [cycle.side for cycle in engine.active_cycles] == ["long"]
+    assert engine.realized_pnl == pytest.approx(10.0)
+    engine.close_cycle(110.0, 500_000, "test long")
+    assert not engine.active_cycles
+    assert engine.realized_pnl == pytest.approx(20.0)

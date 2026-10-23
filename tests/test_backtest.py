@@ -11,6 +11,7 @@ from app.backtest import run_backtest
 from app.brokers import PaperBroker, make_broker
 from app.config import BotSettings
 from app.db import Database
+from app.models import Candle
 from app.feed import demo_candles
 
 
@@ -86,7 +87,78 @@ def test_backtest_fees_reduce_profit():
     assert with_fee["total_pnl"] < no_fee["total_pnl"]
 
 
+def test_backtest_reports_margin_rejections_and_directional_leverage():
+    settings = bt_settings(paper_balance_usd=1.0, leverage=1, direction="short")
+    result = run_backtest(demo_candles(1000, seed=11, settings=settings), settings)
+    assert result["margin_rejections"] > 0
+    assert result["cycles"] == 0
+    assert result["initial_balance"] == 1.0
+    assert result["leverage"] == 1
+    assert result["direction"] == "short"
+    assert not result["busted"]
+    assert all(trade["kind"] == "rejected" for trade in result["trades"])
+
+
+def test_backtest_can_open_independent_long_and_short_cycles(monkeypatch):
+    import app.strategy as strategy_module
+    from app.fib import Impulse
+
+    settings = bt_settings(direction="both", allow_opposite_cycles=True, leverage=5,
+                           paper_balance_usd=1000.0, fee_pct=0.0, slippage_pct=0.0)
+
+    def both_signals(candles, side_settings):
+        side = side_settings.direction
+        return Impulse(side=side, move_side="down" if side == "long" else "up",
+                       high=105, low=95, entry_price=100, target=100,
+                       move_pct=10, candles=3, start_ts=1, end_ts=2), "signal"
+
+    monkeypatch.setattr(strategy_module, "detect_signal", both_signals)
+    candles = [Candle(ts=i * 300_000, open=100, high=101, low=99, close=100, volume=1)
+               for i in range(6)]
+    result = run_backtest(candles, settings)
+    entries = [trade for trade in result["trades"] if trade["kind"] == "entry"]
+    assert {trade["side"] for trade in entries} == {"long", "short"}
+    assert len({trade["cycle_id"] for trade in entries}) == 2
+    assert {cycle["side"] for cycle in result["cycles_list"]} == {"long", "short"}
+    assert result["leverage"] == 5
+    assert result["allow_opposite_cycles"] is True
+
+
+def test_backtest_marks_equity_below_zero_as_bankruptcy():
+    settings = bt_settings(direction="long", entry_mode="impulse", candles_count=3,
+                           min_move_pct=1.0, paper_balance_usd=1.0, leverage=100,
+                           max_positions=1, multiplier_start_position=1,
+                           fee_pct=0.0, slippage_pct=0.0)
+    values = [
+        (100, 100.1, 99.9, 100), (100, 100.1, 99.9, 100),
+        (100, 100.1, 99.4, 99.5), (99.5, 99.6, 97.9, 98),
+        (98, 98.1, 94.9, 95), (95, 95.1, 93.9, 94),
+        (94, 94, 1, 1.1),
+    ]
+    candles = [Candle(ts=i * 300_000, open=o, high=h, low=low, close=c, volume=1)
+               for i, (o, h, low, c) in enumerate(values)]
+    result = run_backtest(candles, settings)
+    assert result["busted"] is True
+    assert result["bust_ts"] == candles[-1].ts
+    assert result["final_equity"] <= 0
+    assert result["cycles_list"][-1]["reason"].startswith("слив")
+    assert not result["equity_curve"][-1]["notional_exposure"]
+
+
 # ------------------------------------------------------------------ paper broker
+@pytest.mark.asyncio
+async def test_paper_broker_keeps_long_and_short_exposure_separate():
+    broker = PaperBroker(bt_settings(fee_pct=0, slippage_pct=0))
+    await broker.start()
+    long_fill = await broker.open_position("long", 100.0, 100.0)
+    short_fill = await broker.open_position("short", 100.0, 100.0)
+    assert await broker.exchange_position("long") == pytest.approx(long_fill.qty)
+    assert await broker.exchange_position("short") == pytest.approx(short_fill.qty)
+    await broker.close_position("short", short_fill.qty, 90.0)
+    assert await broker.exchange_position("short") == 0
+    assert await broker.exchange_position("long") == pytest.approx(long_fill.qty)
+
+
 @pytest.mark.asyncio
 async def test_paper_broker_accounting():
     settings = bt_settings(fee_pct=0.1, slippage_pct=0.05)
@@ -111,6 +183,15 @@ async def test_paper_broker_accounting():
 
 def test_make_broker_respects_mode():
     assert isinstance(make_broker(bt_settings(trade_mode="paper")), PaperBroker)
+
+
+def test_opposite_cycles_rejected_outside_paper_futures():
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError, match="только на фьючерсах"):
+        bt_settings(market_type="spot", allow_opposite_cycles=True)
+    with pytest.raises(ValidationError, match="только в paper и бэктесте"):
+        bt_settings(data_source="gate", trade_mode="live", allow_opposite_cycles=True)
 
 
 # ------------------------------------------------------------------ live loop

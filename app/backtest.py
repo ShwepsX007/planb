@@ -5,7 +5,7 @@ import statistics
 from typing import Any, Dict, List, Optional, Sequence
 
 from .config import BotSettings
-from .models import Candle, Fill
+from .models import Action, Candle, Fill
 from .strategy import StrategyEngine
 
 
@@ -20,17 +20,20 @@ def _fill(action, settings: BotSettings, *, closing: bool) -> Fill:
     return Fill(price=price, qty=qty, fee=fee, ts=action.ts, order_id="sim")
 
 
-def _track_backtest_exposure(cycle, price: float, initial_balance: float,
-                             realized_pnl: float, settings: BotSettings) -> None:
-    notional = sum(p.qty * price for p in cycle.open_positions)
-    is_futures = settings.market_type == "futures"
+def _track_backtest_exposure(engine: StrategyEngine, price: float, initial_balance: float,
+                             settings: BotSettings) -> None:
+    cycles = engine.active_cycles
+    if not cycles or price <= 0:
+        return
     leverage = max(1.0, float(settings.leverage or 1.0))
-    margin = notional / leverage if is_futures else notional
-    cycle.peak_notional_usd = max(cycle.peak_notional_usd, notional)
-    cycle.peak_margin_usd = max(cycle.peak_margin_usd, margin)
-    equity = initial_balance + realized_pnl + cycle.unrealized_pnl(price)
-    if equity > 0:
-        cycle.max_deposit_load_pct = max(cycle.max_deposit_load_pct, margin / equity * 100.0)
+    equity = initial_balance + engine.realized_pnl + sum(c.unrealized_pnl(price) for c in cycles)
+    for cycle in cycles:
+        notional = sum(p.qty * price for p in cycle.open_positions)
+        margin = notional / leverage if settings.market_type == "futures" else notional
+        cycle.peak_notional_usd = max(cycle.peak_notional_usd, notional)
+        cycle.peak_margin_usd = max(cycle.peak_margin_usd, margin)
+        if equity > 0:
+            cycle.max_deposit_load_pct = max(cycle.max_deposit_load_pct, margin / equity * 100.0)
 
 
 def _cycle_payload(cycle) -> Dict[str, Any]:
@@ -84,10 +87,10 @@ def run_backtest(candles: Sequence[Candle], settings: BotSettings, *,
     peak_notional = 0.0
     max_margin_used = 0.0
     max_deposit_load_pct = 0.0
-    gross_profit = 0.0
-    gross_loss = 0.0
     cycle_results: List[Dict[str, Any]] = []
-    closed_before = 0
+    margin_rejections = 0
+    busted = False
+    bust_ts: Optional[int] = None
 
     for i, candle in enumerate(candles):
         if i < warmup:
@@ -95,11 +98,30 @@ def run_backtest(candles: Sequence[Candle], settings: BotSettings, *,
             continue
 
         actions = engine.on_candle(candle)
-        # Capture exposure before a possible close action removes the cycle.
-        if engine.cycle is not None and engine.cycle.open_positions:
-            _track_backtest_exposure(engine.cycle, candle.close, balance, engine.realized_pnl, settings)
+        # Capture exposure before any action closes or adds to cycles.
+        _track_backtest_exposure(engine, candle.close, balance, settings)
         for action in actions:
             if action.kind in ("entry", "add"):
+                leverage = max(1.0, float(settings.leverage or 1.0))
+                required_margin = (action.volume_usd / leverage
+                                   if settings.market_type == "futures" else action.volume_usd)
+                entry_fee_reserve = action.volume_usd * settings.fee_pct / 100.0
+                open_margin = sum(
+                    sum(p.qty * candle.close for p in c.open_positions) / leverage
+                    if settings.market_type == "futures"
+                    else sum(p.qty * candle.close for p in c.open_positions)
+                    for c in engine.active_cycles)
+                open_unrealized = sum(c.unrealized_pnl(candle.close) for c in engine.active_cycles)
+                available_equity = balance + engine.realized_pnl + open_unrealized - open_margin
+                if required_margin + entry_fee_reserve > max(0.0, available_equity) + 1e-9:
+                    margin_rejections += 1
+                    if action.kind == "entry" and action.cycle_id:
+                        engine.discard_empty_cycle(action.cycle_id)
+                    trades.append({"ts": candle.ts, "kind": "rejected", "side": action.side,
+                                   "idx": action.position_idx, "price": round(candle.close, 8),
+                                   "volume_usd": round(action.volume_usd, 6), "reason": "недостаточно свободной маржи",
+                                   "cycle_id": action.cycle_id})
+                    continue
                 fill = _fill(action, settings, closing=False)
                 engine.apply_fill(action, fill)
                 trades.append({
@@ -107,11 +129,15 @@ def run_backtest(candles: Sequence[Candle], settings: BotSettings, *,
                     "idx": action.position_idx, "price": round(fill.price, 8),
                     "qty": round(fill.qty, 10), "volume_usd": round(fill.qty * fill.price, 6),
                     "fee": round(fill.fee, 8), "reason": action.reason,
-                    "target": round(action.target, 8),
+                    "target": round(action.target, 8), "cycle_id": action.cycle_id,
                 })
             elif action.kind == "close_all":
+                cycle = engine.get_cycle(action.cycle_id, side=action.side)
+                if cycle is None:
+                    continue
                 fill = _fill(action, settings, closing=True)
-                cycle = engine.close_cycle(fill.price, candle.ts, action.reason, fee=fill.fee)
+                cycle = engine.close_cycle(fill.price, candle.ts, action.reason, fee=fill.fee,
+                                           cycle_id=cycle.id)
                 trades.append({
                     "ts": candle.ts, "kind": "close_all", "side": action.side, "idx": 0,
                     "price": round(fill.price, 8), "qty": round(fill.qty, 10),
@@ -120,28 +146,22 @@ def run_backtest(candles: Sequence[Candle], settings: BotSettings, *,
                     "cycle_pnl": round(cycle.pnl, 8), "cycle_id": cycle.id,
                 })
                 cycle_results.append(_cycle_payload(cycle))
-                if cycle.pnl >= 0:
-                    gross_profit += cycle.pnl
-                else:
-                    gross_loss += -cycle.pnl
-                closed_before = len(engine.closed_cycles)
 
-        if engine.cycle is not None and engine.cycle.open_positions:
-            _track_backtest_exposure(engine.cycle, candle.close, balance, engine.realized_pnl, settings)
-        # Equity is marked to the candle close. Drawdown is therefore the
-        # close-to-close equity drawdown (realized + unrealized, including fees).
-        unreal = engine.cycle.unrealized_pnl(candle.close) if engine.cycle else 0.0
+        _track_backtest_exposure(engine, candle.close, balance, settings)
+        # Equity is marked to the candle close. Drawdown is close-to-close equity
+        # (realized + unrealized, including fees), over all open cycles.
+        unreal = sum(c.unrealized_pnl(candle.close) for c in engine.active_cycles)
         equity = balance + engine.realized_pnl + unreal
         peak = max(peak, equity)
         dd = peak - equity
         if dd > max_dd:
             max_dd = dd
             max_dd_pct = dd / peak * 100 if peak else 0.0
-        if engine.cycle:
-            depth_series.append(len(engine.cycle.positions))
-        notional = sum(p.qty * candle.close for p in engine.cycle.open_positions) if engine.cycle else 0.0
+        if engine.active_cycles:
+            depth_series.append(sum(len(c.positions) for c in engine.active_cycles))
+        notional = sum(p.qty * candle.close for c in engine.active_cycles for p in c.open_positions)
         margin = notional / max(1.0, float(settings.leverage or 1.0)) \
-            if engine.cycle and settings.market_type == "futures" else notional
+            if settings.market_type == "futures" else notional
         peak_notional = max(peak_notional, notional)
         max_margin_used = max(max_margin_used, margin)
         deposit_load = margin / equity * 100.0 if equity > 0 else 0.0
@@ -154,35 +174,73 @@ def run_backtest(candles: Sequence[Candle], settings: BotSettings, *,
                              "notional_exposure": round(notional, 6),
                              "margin_used_estimate": round(margin, 6),
                              "deposit_load_pct": round(deposit_load, 4)})
+        if equity <= 0:
+            busted = True
+            bust_ts = candle.ts
+            for active in list(engine.active_cycles):
+                action = Action(kind="close_all", side=active.side, ref_price=candle.close,
+                                qty=active.total_qty, reason="слив: equity <= 0",
+                                ts=candle.ts, cycle_id=active.id)
+                fill = _fill(action, settings, closing=True)
+                closed = engine.close_cycle(fill.price, candle.ts, action.reason,
+                                            fee=fill.fee, cycle_id=active.id)
+                cycle_results.append(_cycle_payload(closed))
+            equity = balance + engine.realized_pnl
+            peak = max(peak, equity)
+            dd = max(0.0, peak - equity)
+            max_dd = max(max_dd, dd)
+            max_dd_pct = max(max_dd_pct, dd / peak * 100 if peak else 0.0)
+            equity_curve[-1].update({"equity": round(equity, 6),
+                                     "realized": round(engine.realized_pnl, 6),
+                                     "unrealized": 0.0, "peak_equity": round(peak, 6),
+                                     "drawdown_usd": round(dd, 6),
+                                     "drawdown_pct": round(dd / peak * 100 if peak else 0.0, 4),
+                                     "notional_exposure": 0.0,
+                                     "margin_used_estimate": 0.0, "deposit_load_pct": 0.0})
+            engine.stop("слив: equity опустился до нуля или ниже")
+            break
 
-    # close a dangling position at the last price so the numbers add up
-    if engine.cycle is not None and candles:
+    # Close dangling cycles at the last price so the statistics add up.
+    if engine.active_cycles and candles and not busted:
         last = candles[-1]
-        fill = Fill(price=last.close, qty=engine.cycle.total_qty,
-                    fee=engine.cycle.total_qty * last.close * settings.fee_pct / 100.0,
-                    ts=last.ts, order_id="sim")
-        cycle = engine.close_cycle(last.close, last.ts, "конец бэктеста", fee=fill.fee)
-        cycle_results.append(_cycle_payload(cycle))
+        for active in list(engine.active_cycles):
+            qty = active.total_qty
+            fill = Fill(price=last.close, qty=qty,
+                        fee=qty * last.close * settings.fee_pct / 100.0,
+                        ts=last.ts, order_id="sim")
+            cycle = engine.close_cycle(last.close, last.ts, "конец бэктеста", fee=fill.fee,
+                                       cycle_id=active.id)
+            cycle_results.append(_cycle_payload(cycle))
         unreal = 0.0
         equity = balance + engine.realized_pnl
+        peak = max(peak, equity)
+        dd = max(0.0, peak - equity)
+        max_dd = max(max_dd, dd)
+        max_dd_pct = max(max_dd_pct, dd / peak * 100 if peak else 0.0)
         equity_curve.append({"ts": last.ts, "equity": round(equity, 6),
                              "realized": round(engine.realized_pnl, 6), "unrealized": 0.0,
-                             "price": last.close})
+                             "price": last.close, "peak_equity": round(peak, 6),
+                             "drawdown_usd": round(dd, 6),
+                             "drawdown_pct": round(dd / peak * 100 if peak else 0.0, 4),
+                             "notional_exposure": 0.0, "margin_used_estimate": 0.0,
+                             "deposit_load_pct": 0.0})
 
     total_pnl = engine.realized_pnl
-    fees_total = sum(c.fees for c in engine.closed_cycles)
+    gross_profit = sum(max(0.0, float(c.get("pnl") or 0.0)) for c in cycle_results)
+    gross_loss = sum(max(0.0, -float(c.get("pnl") or 0.0)) for c in cycle_results)
+    fees_total = sum(c.get("fees", 0.0) for c in cycle_results)
     final_equity = balance + total_pnl
     step = max(1, len(equity_curve) // equity_points)
     curve = equity_curve[::step]
     if equity_curve and curve[-1] is not equity_curve[-1]:
         curve.append(equity_curve[-1])
 
-    cycle_pnls = [c.pnl for c in engine.closed_cycles]
+    cycle_pnls = [float(c["pnl"]) for c in cycle_results]
     position_results = [p for cycle in cycle_results for p in cycle.get("position_details", [])]
     wins = [p for p in cycle_pnls if p >= 0]
     losses = [p for p in cycle_pnls if p < 0]
-    durations = [(c.closed_ts - c.opened_ts) / (settings.tf_seconds() * 1000) for c in engine.closed_cycles
-                 if c.closed_ts and c.opened_ts]
+    durations = [float(c.get("duration_ms") or 0) / (settings.tf_seconds() * 1000)
+                 for c in cycle_results]
 
     return {
         "settings": settings.model_dump(exclude={"api_key", "api_secret"}),
@@ -191,9 +249,15 @@ def run_backtest(candles: Sequence[Candle], settings: BotSettings, *,
         "to_ts": candles[-1].ts,
         "initial_balance": round(balance, 4),
         "final_equity": round(final_equity, 4),
+        "leverage": max(1, int(settings.leverage)) if settings.market_type == "futures" else 1,
+        "direction": settings.direction,
+        "allow_opposite_cycles": settings.allow_opposite_cycles,
+        "margin_rejections": margin_rejections,
+        "busted": busted,
+        "bust_ts": bust_ts,
         "total_pnl": round(total_pnl, 6),
         "return_pct": round(total_pnl / balance * 100, 4) if balance else 0.0,
-        "cycles": len(engine.closed_cycles),
+        "cycles": len(cycle_results),
         "wins": len(wins),
         "losses": len(losses),
         "win_rate": round(len(wins) / len(cycle_pnls) * 100, 2) if cycle_pnls else 0.0,

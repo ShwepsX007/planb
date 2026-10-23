@@ -18,9 +18,10 @@ class PaperBroker(Broker):
         self.cash = float(settings.paper_balance_usd)   # free quote currency
         self.realized_pnl = 0.0
         self.fees_paid = 0.0
-        self.open_qty = 0.0
-        self.open_volume_usd = 0.0
-        self.open_side: Optional[Side] = None
+        self._positions: Dict[Side, Dict[str, float]] = {
+            "long": {"qty": 0.0, "volume_usd": 0.0},
+            "short": {"qty": 0.0, "volume_usd": 0.0},
+        }
         self.last_price_value = 0.0
         self.orders: list = []
         self.pending_orders: Dict[str, Dict[str, Any]] = {}
@@ -33,6 +34,19 @@ class PaperBroker(Broker):
         self._market_candle_high = 0.0
         self._market_candle_low = 0.0
 
+    @property
+    def open_qty(self) -> float:
+        return sum(position["qty"] for position in self._positions.values())
+
+    @property
+    def open_volume_usd(self) -> float:
+        return sum(position["volume_usd"] for position in self._positions.values())
+
+    @property
+    def open_side(self) -> Optional[Side]:
+        active = [side for side, position in self._positions.items() if position["qty"] > 1e-12]
+        return active[0] if len(active) == 1 else None
+
     async def start(self) -> None:
         return None
 
@@ -40,9 +54,15 @@ class PaperBroker(Broker):
         """Rebuild the simulated open exposure after a process restart."""
         if cycle is None:
             return
-        self.open_qty = cycle.total_qty
-        self.open_volume_usd = cycle.total_volume_usd
-        self.open_side = cycle.side if self.open_qty > 0 else None
+        cycles = cycle if isinstance(cycle, (list, tuple)) else [cycle]
+        self._positions = {"long": {"qty": 0.0, "volume_usd": 0.0},
+                           "short": {"qty": 0.0, "volume_usd": 0.0}}
+        for item in cycles:
+            if item is None:
+                continue
+            position = self._positions[item.side]
+            position["qty"] += item.total_qty
+            position["volume_usd"] += item.total_volume_usd
 
     async def set_price(self, price: float) -> None:
         if price > 0:
@@ -119,28 +139,25 @@ class PaperBroker(Broker):
     def _fill_limit_add(self, order: Dict[str, Any], price: float) -> Fill:
         qty = float(order["qty"])
         fee = qty * price * self.settings.fee_pct / 100.0
-        self.open_qty += qty
-        self.open_volume_usd += qty * price
-        self.open_side = order["side"]
+        position = self._positions[order["side"]]
+        position["qty"] += qty
+        position["volume_usd"] += qty * price
         self.cash -= fee
         self.fees_paid += fee
         return Fill(price=price, qty=qty, fee=fee, ts=now_ms(), order_id=order["id"],
                     info={"side": order["side"], "purpose": "add"})
 
     async def _fill_limit_close(self, order: Dict[str, Any], price: float) -> Fill:
-        qty = min(float(order["qty"]), self.open_qty)
+        position = self._positions[order["side"]]
+        qty = min(float(order["qty"]), position["qty"])
         fee = qty * price * self.settings.fee_pct / 100.0
-        basis = self.open_volume_usd * (qty / self.open_qty) if self.open_qty else 0.0
+        basis = position["volume_usd"] * (qty / position["qty"]) if position["qty"] else 0.0
         proceeds = price * qty
         self.realized_pnl += (proceeds - basis) if order["side"] == "long" else (basis - proceeds)
         self.cash -= fee
         self.fees_paid += fee
-        self.open_volume_usd = max(0.0, self.open_volume_usd - basis)
-        self.open_qty = max(0.0, self.open_qty - qty)
-        if self.open_qty <= 1e-12:
-            self.open_qty = 0.0
-            self.open_volume_usd = 0.0
-            self.open_side = None
+        position["volume_usd"] = max(0.0, position["volume_usd"] - basis)
+        position["qty"] = max(0.0, position["qty"] - qty)
         return Fill(price=price, qty=qty, fee=fee, ts=now_ms(), order_id=order["id"],
                     info={"side": order["side"], "purpose": "tp"})
 
@@ -198,9 +215,9 @@ class PaperBroker(Broker):
         price = self.apply_slippage(ref_price, adverse=True)
         qty = volume_usd / price
         fee = qty * price * self.settings.fee_pct / 100.0
-        self.open_qty += qty
-        self.open_volume_usd += qty * price
-        self.open_side = side
+        position = self._positions[side]
+        position["qty"] += qty
+        position["volume_usd"] += qty * price
         self.cash -= fee
         self.fees_paid += fee
         fill = Fill(price=price, qty=qty, fee=fee, ts=ts or now_ms(),
@@ -212,21 +229,18 @@ class PaperBroker(Broker):
                             ts: Optional[int] = None, reason: str = "") -> Fill:
         if ref_price <= 0:
             raise BrokerError("нет цены для закрытия позиции")
-        qty = min(qty, self.open_qty) if self.open_qty else qty
+        position = self._positions[side]
+        qty = min(qty, position["qty"]) if position["qty"] else qty
         price = self.apply_slippage(ref_price, adverse=False)
         fee = qty * price * self.settings.fee_pct / 100.0
-        # book the closed part: cost basis -> proceeds
-        basis = self.open_volume_usd * (qty / self.open_qty) if self.open_qty else 0.0
+        # book the closed part: cost basis -> proceeds for the requested side
+        basis = position["volume_usd"] * (qty / position["qty"]) if position["qty"] else 0.0
         proceeds = price * qty
         self.realized_pnl += (proceeds - basis) if side == "long" else (basis - proceeds)
         self.cash -= fee
         self.fees_paid += fee
-        self.open_volume_usd = max(0.0, self.open_volume_usd - basis)
-        self.open_qty = max(0.0, self.open_qty - qty)
-        if self.open_qty <= 1e-12:
-            self.open_qty = 0.0
-            self.open_volume_usd = 0.0
-            self.open_side = None
+        position["volume_usd"] = max(0.0, position["volume_usd"] - basis)
+        position["qty"] = max(0.0, position["qty"] - qty)
         fill = Fill(price=price, qty=qty, fee=fee, ts=ts or now_ms(),
                     order_id=f"paper-{len(self.orders)}", info={"side": side, "reason": reason})
         self.orders.append(fill)
@@ -249,4 +263,4 @@ class PaperBroker(Broker):
         }
 
     async def exchange_position(self, side: Side) -> float:
-        return self.open_qty if self.open_side == side else 0.0
+        return self._positions[side]["qty"]
