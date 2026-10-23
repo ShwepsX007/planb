@@ -121,11 +121,12 @@
 
     <div class="box">
       <h2>Позиции текущего цикла</h2>
-      <table class="tbl" id="currentPositions">
-        <thead><tr><th>#</th><th>Время</th><th>Цена входа</th><th>Объём, $</th><th>Кол-во</th>
-          <th>Множитель</th><th>P/L</th></tr></thead>
+      <div class="table-scroll"><table class="tbl" id="currentPositions">
+        <thead><tr><th>#</th><th>Время входа</th><th>В позиции</th><th>Цена входа</th><th>Объём входа, $</th>
+          <th>Кол-во</th><th>Множитель</th><th>Текущий номинал, $</th><th>Комиссия входа, $</th>
+          <th>Плавающий P/L, $</th><th>P/L, %</th></tr></thead>
         <tbody></tbody>
-      </table>
+      </table></div>
     </div>
 
     <div class="grid2">
@@ -200,19 +201,24 @@
         <button class="btn btn-small" id="btnResetCycle"
           title="Закрыть незакрытый цикл в учёте, если позиция уже закрыта на бирже вручную">Сбросить цикл</button></div>
       </div>
-      <table class="tbl" id="cyclesTable">
-        <thead><tr><th>Цикл</th><th>Сторона</th><th>Позиций</th><th>Средняя</th><th>Цель</th>
-          <th>Закрытие</th><th>Объём, $</th><th>P/L, $</th><th>P/L, %</th><th>Причина</th></tr></thead>
+      <p class="muted">Неблагоприятный P/L — худший наблюдавшийся плавающий результат цикла с учётом комиссии входа; процент рассчитан от объёма входов. Нагрузка — оценка маржи относительно account total balance (фьючерсы: номинал / плечо, без maintenance margin/funding; спот: полный номинал). Для биржевого фактического значения смотрите отдельное поле used.</p>
+      <div class="table-scroll"><table class="tbl" id="cyclesTable">
+        <thead><tr><th>Цикл</th><th>Сторона</th><th>Вход</th><th>Выход</th><th>Длительность</th>
+          <th>Позиций</th><th>Средний вход</th><th>Цель</th><th>Цена выхода</th><th>Объём входов, $</th><th>Комиссии, $</th>
+          <th>Макс. неблагопр. P/L, $ / %</th><th>Пик номинала, $</th><th>Пик маржи, $</th><th>Пик нагрузки, %</th>
+          <th>P/L, $</th><th>P/L, %</th><th>Причина</th></tr></thead>
         <tbody></tbody>
-      </table>
+      </table></div>
     </div>
     <div class="box">
       <h2>Все сделки</h2>
-      <table class="tbl" id="tradesTable">
-        <thead><tr><th>Цикл</th><th>#</th><th>Время</th><th>Цена входа</th><th>Объём, $</th>
-          <th>Кол-во</th><th>Множитель</th><th>Цена выхода</th><th>P/L, $</th></tr></thead>
+      <div class="table-scroll"><table class="tbl" id="tradesTable">
+        <thead><tr><th>Цикл</th><th>#</th><th>Сторона</th><th>Время входа</th><th>Время выхода</th>
+          <th>Длительность</th><th>Цена входа</th><th>Цена выхода</th><th>Объём входа, $</th>
+          <th>Объём выхода, $</th><th>Кол-во</th><th>Множитель</th><th>Комиссии, $</th>
+          <th>P/L, $</th><th>P/L, %</th></tr></thead>
         <tbody></tbody>
-      </table>
+      </table></div>
     </div>
   </section>
 
@@ -264,15 +270,24 @@
 
     <div class="cards" id="btStats"></div>
     <div class="grid2">
-      <div class="box"><h2>Кривая доходности</h2><div id="btEquity" class="chart chart-small"></div></div>
-      <div class="box"><h2>График сделок</h2><div id="btChart" class="chart chart-small"></div></div>
+      <div class="box"><h2>Кривая equity / баланса</h2><div id="btEquity" class="chart chart-small"></div></div>
+      <div class="box"><h2>График входов</h2><div id="btChart" class="chart chart-small"></div></div>
     </div>
+    <div class="box"><h2>История нагрузки на депозит</h2><div id="btLoad" class="chart chart-small"></div></div>
     <div class="box">
       <h2>Циклы бэктеста</h2>
       <p class="muted" id="btDataInfo"></p>
-      <table class="tbl" id="btCycles"><thead><tr><th>#</th><th>Сторона</th><th>Позиций</th><th>Средняя</th>
-        <th>Цель</th><th>Цена выхода</th><th>Объём, $</th><th>P/L, $</th><th>P/L, %</th><th>Причина</th></tr></thead>
-        <tbody></tbody></table>
+      <p class="muted">Просадка в статистике рассчитана по close-to-close equity: realized + плавающий P/L, комиссии учтены. Неблагоприятный P/L цикла — максимальный наблюдавшийся плавающий убыток; процент — от суммарного объёма входов. Загрузка капитала — оценка маржи относительно текущего equity (фьючерсы: номинал / плечо, без maintenance margin/funding; спот: полный номинал), не фактическая маржа биржи.</p>
+      <div class="table-scroll"><table class="tbl" id="btCycles"><thead><tr><th>#</th><th>Сторона</th><th>Вход</th><th>Выход</th>
+        <th>Длительность</th><th>Позиций</th><th>Средний вход</th><th>Цель</th><th>Выход</th><th>Вложено, $</th><th>Комиссии, $</th>
+        <th>Макс. неблагопр. P/L, $ / %</th><th>Пик номинала, $</th><th>Пик маржи, $</th><th>Пик нагрузки, %</th>
+        <th>P/L, $</th><th>P/L, %</th><th>Причина</th></tr></thead>
+        <tbody></tbody></table></div>
+      <h3>Позиции бэктеста — входы и выходы</h3>
+      <div class="table-scroll"><table class="tbl" id="btPositions"><thead><tr><th>Цикл</th><th>#</th><th>Сторона</th>
+        <th>Время входа</th><th>Время выхода</th><th>Длительность</th><th>Цена входа</th><th>Цена выхода</th>
+        <th>Объём входа, $</th><th>Объём выхода, $</th><th>Кол-во</th><th>Множитель</th><th>Комиссии, $</th>
+        <th>P/L, $</th><th>P/L, %</th></tr></thead><tbody></tbody></table></div>
     </div>
   </section>
 

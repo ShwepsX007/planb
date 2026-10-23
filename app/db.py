@@ -39,6 +39,11 @@ CREATE TABLE IF NOT EXISTS cycles (
     pnl REAL,
     pnl_pct REAL,
     fees REAL,
+    max_adverse_pnl_usd REAL NOT NULL DEFAULT 0,
+    max_adverse_pnl_pct REAL NOT NULL DEFAULT 0,
+    peak_notional_usd REAL NOT NULL DEFAULT 0,
+    peak_margin_usd REAL NOT NULL DEFAULT 0,
+    max_deposit_load_pct REAL NOT NULL DEFAULT 0,
     note TEXT
 );
 CREATE TABLE IF NOT EXISTS positions (
@@ -84,6 +89,11 @@ class Database:
         self.conn.row_factory = sqlite3.Row
         with self._lock:
             self.conn.executescript(SCHEMA)
+            cycle_columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(cycles)")}
+            for name in ("max_adverse_pnl_usd", "max_adverse_pnl_pct", "peak_notional_usd",
+                         "peak_margin_usd", "max_deposit_load_pct"):
+                if name not in cycle_columns:
+                    self.conn.execute(f"ALTER TABLE cycles ADD COLUMN {name} REAL NOT NULL DEFAULT 0")
             self.conn.execute("PRAGMA journal_mode=WAL")
             self.conn.commit()
         try:
@@ -135,19 +145,28 @@ class Database:
             self.conn.execute(
                 """INSERT INTO cycles(id, side, signal_ts, opened_ts, closed_ts, status, swing_high,
                        swing_low, goal_pct, target, avg_entry, close_price, close_reason,
-                       positions_count, qty, volume_usd, pnl, pnl_pct, fees, note)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                       positions_count, qty, volume_usd, pnl, pnl_pct, fees,
+                       max_adverse_pnl_usd, max_adverse_pnl_pct, peak_notional_usd,
+                       peak_margin_usd, max_deposit_load_pct, note)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                    ON CONFLICT(id) DO UPDATE SET
                        closed_ts=excluded.closed_ts, status=excluded.status, target=excluded.target,
                        swing_low=excluded.swing_low, swing_high=excluded.swing_high,
                        avg_entry=excluded.avg_entry, close_price=excluded.close_price,
                        close_reason=excluded.close_reason, positions_count=excluded.positions_count,
                        qty=excluded.qty, volume_usd=excluded.volume_usd, pnl=excluded.pnl,
-                       pnl_pct=excluded.pnl_pct, fees=excluded.fees""",
+                       pnl_pct=excluded.pnl_pct, fees=excluded.fees,
+                       max_adverse_pnl_usd=excluded.max_adverse_pnl_usd,
+                       max_adverse_pnl_pct=excluded.max_adverse_pnl_pct,
+                       peak_notional_usd=excluded.peak_notional_usd,
+                       peak_margin_usd=excluded.peak_margin_usd,
+                       max_deposit_load_pct=excluded.max_deposit_load_pct""",
                 (cycle.id, cycle.side, cycle.signal_ts, cycle.opened_ts, cycle.closed_ts, cycle.status,
                  cycle.swing_high, cycle.swing_low, cycle.goal_pct, cycle.target, cycle.avg_entry,
                  cycle.close_price, cycle.close_reason, len(cycle.positions), cycle.total_qty,
-                 cycle.invested_volume_usd, cycle.pnl, cycle.pnl_pct, cycle.fees, cycle.note))
+                 cycle.invested_volume_usd, cycle.pnl, cycle.pnl_pct, cycle.fees,
+                 cycle.max_adverse_pnl_usd, cycle.max_adverse_pnl_pct, cycle.peak_notional_usd,
+                 cycle.peak_margin_usd, cycle.max_deposit_load_pct, cycle.note))
             self.conn.commit()
 
     def save_position(self, cycle: Cycle, pos: Position) -> None:

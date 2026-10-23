@@ -395,11 +395,11 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
 
     # --------------------------------------------------------------- history
     @app.get("/api/cycles")
-    async def cycles(limit: int = Query(default=100, ge=1, le=1000)):
+    async def cycles(limit: int = Query(default=100, ge=1, le=5000)):
         return {"ok": True, "cycles": db.list_cycles(limit)}
 
     @app.get("/api/positions")
-    async def positions(limit: int = Query(default=200, ge=1, le=2000)):
+    async def positions(limit: int = Query(default=200, ge=1, le=10000)):
         return {"ok": True, "positions": db.all_positions(limit)}
 
     @app.get("/api/logs")

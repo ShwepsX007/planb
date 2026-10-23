@@ -187,6 +187,10 @@ class BotRuntime:
                     self.balance = await asyncio.wait_for(self.broker.balance(), timeout=timeout)
                     if float(self.balance.get("total") or 0.0) <= 0:
                         raise BrokerError("на Gate.io нулевой доступный баланс — live-торговля не запущена")
+                else:
+                    # Paper starts with a baseline balance too, so deposit-load
+                    # estimates are available before its first periodic refresh.
+                    self.balance = await asyncio.wait_for(self.broker.balance(), timeout=timeout)
                 # сетевые запросы к бирже ограничены по времени: иначе «зависшая»
                 # биржа оставляла бота и панель без ответа на неопределённый срок
                 history = await asyncio.wait_for(self.feed.history(self.settings.candle_lookback),
@@ -475,6 +479,7 @@ class BotRuntime:
                     if self.paused:
                         actions = [a for a in actions if a.kind == "close_all"]
                     await self._execute(actions)
+                    self._track_cycle_exposure(candle.close)
                 if price > 0:
                     await self.broker.update_market(price, live_candle)
                     # Strategy updates the grid from the current tick before
@@ -482,6 +487,7 @@ class BotRuntime:
                     actions = self.engine.on_tick(price, live_candle)
                     await self._poll_managed_orders()
                     await self._execute(actions)
+                    self._track_cycle_exposure(price)
                 await self._sync_cycle_orders()
                 # Give paper orders one price-only check after submission. Do not
                 # reuse this candle's old high/low: those wicks may predate the order.
@@ -602,6 +608,23 @@ class BotRuntime:
         self.signal_scan = scan
         self.broadcast({"type": "snapshot", "snapshot": self.snapshot()})
         return {"ok": True, **scan}
+
+    def _track_cycle_exposure(self, mark_price: float) -> None:
+        cycle = self.engine.cycle
+        if cycle is None or mark_price <= 0:
+            return
+        notional = sum(p.qty * mark_price for p in cycle.open_positions)
+        is_futures = self.settings.market_type == "futures"
+        leverage = max(1.0, float(self.settings.leverage or 1.0))
+        margin = notional / leverage if is_futures else notional
+        cycle.peak_notional_usd = max(cycle.peak_notional_usd, notional)
+        cycle.peak_margin_usd = max(cycle.peak_margin_usd, margin)
+        try:
+            equity = float((self.balance or {}).get("total") or 0)
+        except (TypeError, ValueError):
+            equity = 0.0
+        if equity > 0:
+            cycle.max_deposit_load_pct = max(cycle.max_deposit_load_pct, margin / equity * 100.0)
 
     async def _refresh_account(self) -> None:
         if self.settings.synthetic_data and self.engine.last_price > 0:
@@ -950,6 +973,30 @@ class BotRuntime:
                 "zero_at": "low" if cycle.move_side == "down" else "high",
                 "levels": [{"level": cycle.goal_pct, "price": cycle.target, "label": "цель"}],
             }
+        mark = self.engine.last_price
+        cycle_notional = (sum(p.qty * mark for p in cycle.open_positions)
+                          if cycle is not None and mark > 0 else 0.0)
+        is_futures = self.settings.market_type == "futures"
+        leverage = max(1.0, float(self.settings.leverage or 1.0))
+        estimated_margin = cycle_notional / leverage if is_futures else cycle_notional
+        try:
+            account_total = float((self.balance or {}).get("total") or 0)
+        except (TypeError, ValueError):
+            account_total = 0.0
+        account_metrics = {
+            "total_balance": account_total,
+            "free_balance": (self.balance or {}).get("free"),
+            "exchange_used": (self.balance or {}).get("used"),
+            "cycle_notional": cycle_notional,
+            "estimated_margin": estimated_margin,
+            "deposit_load_pct": estimated_margin / account_total * 100 if account_total > 0 else None,
+            "leverage": leverage if is_futures else 1.0,
+            "margin_basis": ("оценка: номинал / плечо; без maintenance margin и funding"
+                             if is_futures else "спот: полный номинал"),
+            "deposit_load_basis": "оценка маржи / account total balance",
+            "used_basis": ("виртуальная номинальная стоимость открытых позиций" if self.settings.trade_mode != "live"
+                           else "поле used, возвращённое Gate.io balance"),
+        }
         return {
             "status": self.status,
             "paused": self.paused,
@@ -967,6 +1014,7 @@ class BotRuntime:
             "loop_count": self.loop_count,
             "price": self.engine.last_price,
             "balance": self.balance,
+            "account_metrics": account_metrics,
             "exchange_position": self.exchange_position,
             "engine": engine_state,
             "stats_24h": self._daily_stats(),

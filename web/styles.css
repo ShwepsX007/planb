@@ -84,6 +84,7 @@ main{padding:16px 18px 60px;max-width:1600px;margin:0 auto}
 .kv .v{font-variant-numeric:tabular-nums;text-align:right}
 
 /* ------------------------------------------------------------------- tables */
+.table-scroll{max-width:100%;overflow-x:auto;overscroll-behavior-x:contain}
 .tbl{width:100%;border-collapse:collapse;font-size:12.5px;font-variant-numeric:tabular-nums}
 .tbl th{text-align:left;color:var(--muted);font-weight:500;border-bottom:1px solid var(--line);padding:6px 8px;
   font-size:11px;text-transform:uppercase;letter-spacing:.04em;white-space:nowrap}

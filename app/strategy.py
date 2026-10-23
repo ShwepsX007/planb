@@ -125,6 +125,15 @@ class StrategyEngine:
             return [self._open_cycle(impulse, live, action_ts=now_ms())]
 
         cycle = self.cycle
+        # For a candle that began after entry, its completed/live adverse extreme
+        # belongs to the open cycle. On the entry candle use only observed ticks:
+        # the candle's earlier wick may predate the fill.
+        if live.ts > cycle.risk_candle_ts:
+            adverse = live.low if cycle.side == "long" else live.high
+            self._record_cycle_adverse(cycle, adverse)
+            cycle.risk_candle_ts = live.ts
+        else:
+            self._record_cycle_adverse(cycle, price)
         self._update_cycle_grid(cycle, price, live)
         target_touched_in_profit = ((price >= cycle.target and price > cycle.avg_entry)
                                     if cycle.side == "long" else
@@ -285,6 +294,7 @@ class StrategyEngine:
             goal_pct=s.fib_goal_pct,
             target=impulse.target,
             move_side=impulse.move_side,
+            risk_candle_ts=candle.ts,
             extreme_at_last_entry=impulse.low if impulse.side == "long" else impulse.high,
             note=(f"{'движение целиком' if impulse.mode == 'swing' else 'импульс'}: "
                   f"{impulse.candles} свечей {impulse.move_side} {impulse.move_pct:.2f}% "
@@ -304,8 +314,26 @@ class StrategyEngine:
             ts=action_ts if action_ts is not None else candle.ts,
         )
 
+    @staticmethod
+    def _record_cycle_adverse(cycle: Cycle, price: float) -> None:
+        if price <= 0 or not cycle.open_positions:
+            return
+        adverse_pnl = cycle.unrealized_pnl(price)
+        loss = max(0.0, -adverse_pnl)
+        cycle.max_adverse_pnl_usd = max(cycle.max_adverse_pnl_usd, loss)
+        basis = cycle.invested_volume_usd
+        if basis > 0:
+            cycle.max_adverse_pnl_pct = max(cycle.max_adverse_pnl_pct, loss / basis * 100.0)
+
     def _manage(self, cycle: Cycle, candle: Candle) -> List[Action]:
         s = self.settings
+        # Closed historical candles are safe to use only if the cycle existed
+        # before that candle began; otherwise its wick may predate the entry.
+        if candle.ts > cycle.risk_candle_ts:
+            self._record_cycle_adverse(cycle, candle.low if cycle.side == "long" else candle.high)
+            cycle.risk_candle_ts = candle.ts
+        else:
+            self._record_cycle_adverse(cycle, candle.close)
 
         # 1. stretch / move the grid -----------------------------------------
         if cycle.side == "long":
@@ -639,6 +667,12 @@ class StrategyEngine:
             "goal_pct": cycle.goal_pct, "target": cycle.target, "note": cycle.note,
             "extreme_at_last_entry": cycle.extreme_at_last_entry,
             "max_positions_used": cycle.max_positions_used,
+            "risk_candle_ts": cycle.risk_candle_ts,
+            "max_adverse_pnl_usd": cycle.max_adverse_pnl_usd,
+            "max_adverse_pnl_pct": cycle.max_adverse_pnl_pct,
+            "peak_notional_usd": cycle.peak_notional_usd,
+            "peak_margin_usd": cycle.peak_margin_usd,
+            "max_deposit_load_pct": cycle.max_deposit_load_pct,
             "positions": [
                 {"idx": p.idx, "ts": p.ts, "price": p.price, "qty": p.qty,
                  "volume_usd": p.volume_usd, "fee": p.fee, "multiplier": p.multiplier}
@@ -671,6 +705,12 @@ class StrategyEngine:
                                    or (raw.get("swing_low") if raw.get("side", "long") == "long"
                                        else raw.get("swing_high")) or 0.0),
             max_positions_used=raw.get("max_positions_used", len(positions) or 1),
+            risk_candle_ts=raw.get("risk_candle_ts", raw.get("opened_ts", 0)),
+            max_adverse_pnl_usd=raw.get("max_adverse_pnl_usd", 0.0),
+            max_adverse_pnl_pct=raw.get("max_adverse_pnl_pct", 0.0),
+            peak_notional_usd=raw.get("peak_notional_usd", 0.0),
+            peak_margin_usd=raw.get("peak_margin_usd", 0.0),
+            max_deposit_load_pct=raw.get("max_deposit_load_pct", 0.0),
         )
 
 # ------------------------------------------------------------------ диагностика

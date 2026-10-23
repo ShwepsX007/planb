@@ -87,6 +87,13 @@ class Cycle:
     fees: float = 0.0
     max_positions_used: int = 1
     extreme_at_last_entry: float = 0.0
+    # Risk/exposure observations are persisted with active and completed cycles.
+    risk_candle_ts: int = 0
+    max_adverse_pnl_usd: float = 0.0
+    max_adverse_pnl_pct: float = 0.0
+    peak_notional_usd: float = 0.0
+    peak_margin_usd: float = 0.0
+    max_deposit_load_pct: float = 0.0
     note: str = ""
 
     # ------------------------------------------------------------------ math
@@ -96,7 +103,8 @@ class Cycle:
 
     @property
     def total_qty(self) -> float:
-        return sum(p.qty for p in self.open_positions)
+        positions = self.positions if self.status == "closed" else self.open_positions
+        return sum(p.qty for p in positions)
 
     @property
     def total_volume_usd(self) -> float:
@@ -108,10 +116,11 @@ class Cycle:
 
     @property
     def avg_entry(self) -> float:
-        qty = self.total_qty
+        positions = self.positions if self.status == "closed" else self.open_positions
+        qty = sum(p.qty for p in positions)
         if qty <= 0:
             return 0.0
-        return sum(p.price * p.qty for p in self.open_positions) / qty
+        return sum(p.price * p.qty for p in positions) / qty
 
     @property
     def last_entry_price(self) -> float:

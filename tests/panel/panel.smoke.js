@@ -23,6 +23,7 @@ window.addEventListener('error', (e) => errors.push('window.error: ' + e.message
 
 /* ---- фейковая библиотека графиков ---- */
 const drawnLines = [];
+let chartCount = 0;
 function series() {
   const s = {
     setData: () => {}, setMarkers: () => {},
@@ -32,10 +33,10 @@ function series() {
   return s;
 }
 window.LightweightCharts = {
-  createChart: () => ({
+  createChart: () => { chartCount += 1; return {
     addCandlestickSeries: series, addLineSeries: series, addAreaSeries: series,
     applyOptions: () => {}, timeScale: () => ({ fitContent: () => {} }),
-  }),
+  }; },
   CrosshairMode: { Normal: 0 },
   LineStyle: { Solid: 0, Dotted: 1, Dashed: 2 },
 };
@@ -56,6 +57,9 @@ const snapshot = {
   symbol: 'BTC/USDT', timeframe: '5m', market_type: 'futures', error: '',
   started_at: Date.now() - 60000, last_loop_ts: Date.now(), loop_count: 42,
   price: 59500.5, balance: { mode: 'paper', total: 1005.25, free: 1005.25, used: 160, start_balance: 1000 },
+  account_metrics: { total_balance: 1005.25, free_balance: 1005.25, exchange_used: 160,
+    cycle_notional: 77.35, estimated_margin: 15.47, deposit_load_pct: 1.539,
+    leverage: 5, margin_basis: 'оценка: номинал / плечо' },
   exchange_position: 0, grid: null, target_total_profit: 50,
   stats_24h: { pnl: 1.25, cycles: 2, wins: 1, losses: 1, reset_at: null, window_hours: 24 },
   pending_orders: [{ role: 'add', idx: 4, price: 58800, volume_usd: 40, qty: 0.00068, status: 'open' }],
@@ -73,6 +77,8 @@ const snapshot = {
       open_positions: 3, profit_pct_to_target: 0.508, unrealized_pnl: 0.31,
       expected_pnl_at_target: 0.81, next_position_idx: 4, next_position_volume_usd: 40,
       positions_left: 3, distance_to_target_pct: -0.25, max_positions_used: 3,
+      max_adverse_pnl_usd: 1.2, max_adverse_pnl_pct: 0.75, peak_notional_usd: 80,
+      peak_margin_usd: 16, max_deposit_load_pct: 1.6,
       positions: [
         { idx: 1, ts: Date.now() - 800000, price: 59300, qty: 0.0001686, volume_usd: 10, fee: 0.005, multiplier: 1, is_open: true },
         { idx: 2, ts: Date.now() - 600000, price: 59000, qty: 0.0001695, volume_usd: 10, fee: 0.005, multiplier: 1, is_open: true },
@@ -114,7 +120,9 @@ const btResult = {
   initial_balance: 1000, final_equity: 1012.5, total_pnl: 12.5, return_pct: 1.25,
   cycles: 4, wins: 3, losses: 1, win_rate: 75, avg_cycle_pnl: 3.1, best_cycle: 6.4,
   worst_cycle: -1.2, profit_factor: 4.1, fees_total: 1.7, max_drawdown: 4.2,
-  max_drawdown_pct: 0.42, max_positions_used: 4, avg_cycle_candles: 190, max_cycle_candles: 420,
+  max_drawdown_pct: 0.42, peak_notional_exposure: 180, max_margin_used_estimate: 36,
+  max_deposit_load_pct: 3.6, margin_method: 'оценка: номинал / плечо',
+  max_positions_used: 4, avg_cycle_candles: 190, max_cycle_candles: 420,
   signals_found: 9, stopped: false, stop_reason: '',
   data: { source: 'gate', label: 'история Gate.io BTC/USDT 5m', count: 8640,
           from_utc: '2026-01-01 00:00', to_utc: '2026-01-31 00:00', span_days: 30, gaps: 0,
@@ -122,11 +130,18 @@ const btResult = {
   cycles_list: [{ id: 'btc1', side: 'long', positions: 3, avg_entry: 59000, target: 59300,
                   close_price: 59320, volume_usd: 70, pnl: 6.4, pnl_pct: 0.54, reason: 'цель',
                   opened_ts: Date.now() - 86400000, closed_ts: Date.now() - 80000000,
-                  swing_low: 58600, swing_high: 60100 }],
+                  swing_low: 58600, swing_high: 60100, duration_ms: 6400000,
+                  max_adverse_pnl_usd: 2.2, max_adverse_pnl_pct: 1.3,
+                  peak_notional_usd: 75, peak_margin_usd: 15, max_deposit_load_pct: 1.5 }],
+  positions_list: [{ cycle_id: 'btc1', side: 'long', idx: 1,
+    ts: Date.now() - 86400000, close_ts: Date.now() - 80000000, duration_ms: 6400000,
+    price: 59000, close_price: 59320, qty: 0.0002, volume_usd: 11.8,
+    close_volume_usd: 11.864, multiplier: 1, fees: 0.01, pnl: 0.054, pnl_pct: 0.46 }],
   trades: [{ ts: Date.now() - 86400000, kind: 'entry', side: 'long', idx: 1, price: 59000,
              qty: 0.0001, volume_usd: 10, fee: 0.005, reason: 'вход', target: 59300 }],
   equity_curve: Array.from({ length: 40 }, (_, i) => ({ ts: Date.now() - (40 - i) * 3600000,
-                                                        equity: 1000 + i * 0.3 })),
+    equity: 1000 + i * 0.3, notional_exposure: 20 + i, margin_used_estimate: 4 + i * 0.2,
+    deposit_load_pct: 0.4 + i * 0.02 })),
 };
 let jobPolls = 0;
 let uploaded = null;
@@ -181,8 +196,8 @@ window.fetch = (url, opts) => {
   if (url.includes('/api/settings')) body = settings;
   else if (url.includes('/api/state')) body = snapshot;
   else if (url.includes('/api/logs')) body = { logs: [{ ts: Date.now(), level: 'trade', message: 'Вход long по 59300' }] };
-  else if (url.includes('/api/cycles')) body = { ok: true, cycles: [{ id: 'c1', side: 'long', positions_count: 3, avg_entry: 59050, target: 59350, close_price: 59350, volume_usd: 160, pnl: 0.81, pnl_pct: 0.5, close_reason: 'цель', status: 'closed' }] };
-  else if (url.includes('/api/positions')) body = { ok: true, positions: [{ cycle_id: 'c1', idx: 1, ts: Date.now(), price: 59300, volume_usd: 10, qty: 0.0001686, multiplier: 1, close_price: 59350, close_ts: Date.now(), pnl: 0.01 }] };
+  else if (url.includes('/api/cycles')) body = { ok: true, cycles: [{ id: 'c1', side: 'long', opened_ts: Date.now() - 3600000, closed_ts: Date.now(), positions_count: 3, avg_entry: 59050, target: 59350, close_price: 59350, volume_usd: 160, pnl: 0.81, pnl_pct: 0.5, close_reason: 'цель', status: 'closed', max_adverse_pnl_usd: 2, max_adverse_pnl_pct: 1.2, peak_notional_usd: 160, peak_margin_usd: 32, max_deposit_load_pct: 3.2, fees: 0.2 }] };
+  else if (url.includes('/api/positions')) body = { ok: true, positions: [{ cycle_id: 'c1', side: 'long', idx: 1, ts: Date.now() - 3600000, price: 59300, volume_usd: 10, qty: 0.0001686, fee: 0.005, close_fee: 0.005, multiplier: 1, close_price: 59350, close_ts: Date.now(), pnl: 0.01 }] };
   else if (url.includes('/api/candles')) body = candles;
   return Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve(JSON.stringify(body)) });
 };
@@ -290,10 +305,22 @@ setTimeout(async () => {
   check('таблица позиций цикла заполнена', window.document.querySelectorAll('#currentPositions tbody tr').length === 3,
     window.document.querySelectorAll('#currentPositions tbody tr').length + ' строк');
   check('множитель x2 показан', window.document.querySelector('#currentPositions tbody').textContent.includes('x2'));
+  check('в текущем цикле показаны маржа и максимальный неблагоприятный P/L',
+    $('engineBox').textContent.includes('Оценка требуемой маржи')
+      && $('engineBox').textContent.includes('Худший плавающий P/L цикла'));
+  check('активная позиция показывает длительность и текущий номинал',
+    $('currentPositions').textContent.includes('Текущий номинал')
+      && $('currentPositions').textContent.includes('В позиции'));
   check('блок текущего цикла', $('cycleBox').textContent.includes('abc123'));
   check('журнал', $('logs').textContent.includes('Вход long'));
   check('история циклов', window.document.querySelectorAll('#cyclesTable tbody tr').length === 1);
+  check('история показывает время, максимальную нагрузку и MAE',
+    $('cyclesTable').textContent.includes('Пик нагрузки')
+      && $('cyclesTable').textContent.includes('Макс. неблагопр. P/L'));
   check('сделки', window.document.querySelectorAll('#tradesTable tbody tr').length === 1);
+  check('сделка показывает вход/выход, комиссии и длительность',
+    $('tradesTable').textContent.includes('Время выхода')
+      && $('tradesTable').textContent.includes('Комиссии'));
   check('план объёмов', $('planTable').textContent.includes('160'));
 
   // данные: бейдж и информация об источнике
@@ -335,6 +362,10 @@ setTimeout(async () => {
   check('полоса загрузки заполнена', ($('btProgressBar').style.width || '0%') === '100%',
     $('btProgressBar').style.width);
   check('итоги бэктеста отрисованы', window.document.querySelectorAll('#btCycles tbody tr').length === 1);
+  check('в бэктесте показаны сделки по позициям и расчёт нагрузки',
+    window.document.querySelectorAll('#btPositions tbody tr').length === 1
+      && $('btStats').textContent.includes('Пик маржи / нагрузка'));
+  check('построена история нагрузки депозита', chartCount >= 4, `создано графиков: ${chartCount}`);
   check('сказано, что история реальная', $('btDataInfo').textContent.includes('Реальная история Gate.io'),
     $('btDataInfo').textContent);
   check('карточка итогового баланса',

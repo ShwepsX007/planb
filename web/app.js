@@ -10,6 +10,14 @@ const pct = (v, d = 3) => (v === null || v === undefined || isNaN(v)) ? '—' : 
 const cls = (v) => v > 0 ? 'pos' : v < 0 ? 'neg' : 'neutral';
 const ts = (ms) => ms ? new Date(ms).toLocaleString('ru-RU', { hour12: false }) : '—';
 const timeOnly = (ms) => ms ? new Date(ms).toLocaleTimeString('ru-RU', { hour12: false }) : '—';
+const duration = (ms) => {
+  if (ms === null || ms === undefined || !Number.isFinite(Number(ms)) || Number(ms) < 0) return '—';
+  let seconds = Math.floor(Number(ms) / 1000);
+  const days = Math.floor(seconds / 86400); seconds %= 86400;
+  const hours = Math.floor(seconds / 3600); seconds %= 3600;
+  const mins = Math.floor(seconds / 60);
+  return `${days ? `${days}д ` : ''}${String(hours).padStart(2, '0')}:${String(mins).padStart(2, '0')}`;
+};
 
 /* Префикс пути: панель работает и напрямую (http://host:8015/), и за
    nginx-префиксом (https://host/planb/) — все запросы относительные. */
@@ -18,7 +26,7 @@ const BASE = location.pathname.replace(/[^/]*$/, '') || '/';
 const app = {
   snapshot: null, settings: null, logs: [], ws: null, wsTimer: null,
   chart: null, series: null, priceLines: [], lastChartUpdate: 0, chartTabActive: false,
-  btChart: null, btSeries: null, btEquity: null, btEquitySeries: null, btLines: [],
+  btChart: null, btSeries: null, btEquity: null, btEquitySeries: null, btLoad: null, btLoadSeries: null, btLines: [],
   openPositions: [], cycles: [], trades: [],
 };
 
@@ -331,6 +339,17 @@ function renderEngineBox(e, s, c) {
     ['Комиссия/слиппедж', `${app.settings?.fee_pct ?? '—'} % / ${app.settings?.slippage_pct ?? '—'} %`],
     ['Обновление', timeOnly(s.updated_at)],
   ];
+  const account = s.account_metrics || {};
+  rows.push(['Баланс total / свободно', `${fmt(account.total_balance, 2)} $ / ${fmt(account.free_balance, 2)} $`]);
+  rows.push(['Занято (reported)', `${fmt(account.exchange_used, 2)} $ · ${account.used_basis || '—'}`]);
+  rows.push(['Экспозиция цикла (номинал)', `${fmt(account.cycle_notional, 2)} $`]);
+  rows.push(['Оценка требуемой маржи', `${fmt(account.estimated_margin, 2)} $ (${pct(account.deposit_load_pct, 2)})`]);
+  rows.push(['Как оценена маржа', account.margin_basis || '—']);
+  if (c) {
+    rows.push(['Время в цикле', duration(Date.now() - c.opened_ts)]);
+    rows.push(['Худший плавающий P/L цикла', `${money(-Math.abs(Number(c.max_adverse_pnl_usd || 0)), 4)} (${pct(-Math.abs(Number(c.max_adverse_pnl_pct || 0)), 2)} от входного объёма)`]);
+    rows.push(['Пиковая нагрузка цикла', `${fmt(c.peak_margin_usd, 2)} $ · ${pct(c.max_deposit_load_pct, 2)}`]);
+  }
   const feed = s.feed || {};
   rows.push(['Источник данных', feed.label || (s.data_real ? 'реальные свечи' : 'синтетика')]);
   if (feed.live_ts) rows.push(['Текущая свеча', ts(feed.live_ts)]);
@@ -357,16 +376,20 @@ function renderEngineBox(e, s, c) {
 function renderCurrentPositions(c) {
   const tbody = $('currentPositions').querySelector('tbody');
   if (!c || !c.positions || !c.positions.length) {
-    tbody.innerHTML = '<tr class="empty"><td colspan="7">позиций нет</td></tr>';
+    tbody.innerHTML = '<tr class="empty"><td colspan="11">позиций нет</td></tr>';
     return;
   }
   const price = app.snapshot?.price || 0;
+  const now = Date.now();
   tbody.innerHTML = c.positions.map((p) => {
-    const pnl = c.side === 'long' ? (price - p.price) * p.qty : (p.price - price) * p.qty;
-    return `<tr><td><b>${p.idx}</b></td><td>${ts(p.ts)}</td><td>${fmt(p.price, 2)}</td>
-      <td>${fmt(p.volume_usd, 2)}</td><td>${p.qty}</td>
+    const gross = c.side === 'long' ? (price - p.price) * p.qty : (p.price - price) * p.qty;
+    const pnl = gross - Number(p.fee || 0);
+    const markValue = price * p.qty;
+    return `<tr><td><b>${p.idx}</b></td><td>${ts(p.ts)}</td><td>${duration(now - p.ts)}</td>
+      <td>${fmt(p.price, 2)}</td><td>${fmt(p.volume_usd, 2)}</td><td>${fmt(p.qty, 8)}</td>
       <td>${p.multiplier && p.multiplier > 1 ? `<b class="pos">x${p.multiplier}</b>` : 'x1'}</td>
-      <td class="${cls(pnl)}">${money(pnl, 4)}</td></tr>`;
+      <td>${fmt(markValue, 2)}</td><td>${fmt(p.fee, 4)}</td>
+      <td class="${cls(pnl)}">${money(pnl, 4)}</td><td class="${cls(pnl)}">${pct(p.volume_usd ? pnl / p.volume_usd * 100 : 0, 3)}</td></tr>`;
   }).join('');
 }
 
@@ -574,7 +597,7 @@ async function loadPositions() {
 /* ----------------------------------------------------------------- cycles */
 async function loadHistory() {
   try {
-    const [cy, pos] = await Promise.all([api('GET', '/api/cycles?limit=200'), api('GET', '/api/positions?limit=300')]);
+    const [cy, pos] = await Promise.all([api('GET', '/api/cycles?limit=5000'), api('GET', '/api/positions?limit=10000')]);
     app.cycles = cy.cycles || []; app.trades = pos.positions || [];
     renderCycles(); renderTrades(); renderRecentCycles();
   } catch (e) { toast('Не удалось загрузить историю: ' + e.message, 'err'); }
@@ -605,29 +628,49 @@ function renderRecentCycles() {
 
 function renderCycles() {
   const tbody = $('cyclesTable').querySelector('tbody');
-  if (!app.cycles.length) { tbody.innerHTML = '<tr class="empty"><td colspan="10">циклов пока нет</td></tr>'; return; }
-  tbody.innerHTML = app.cycles.map((c) => `<tr>
-    <td>${c.id}</td><td>${c.side}</td><td>${c.positions_count}</td>
-    <td>${fmt(c.avg_entry, 2)}</td><td>${fmt(c.target, 2)}</td><td>${fmt(c.close_price, 2)}</td>
-    <td>${fmt(c.volume_usd, 2)}</td><td class="${cls(c.pnl)}"><b>${money(c.pnl, 4)}</b></td>
-    <td class="${cls(c.pnl_pct)}">${pct(c.pnl_pct)}</td><td class="muted">${c.close_reason || ''}</td></tr>`).join('');
+  if (!app.cycles.length) { tbody.innerHTML = '<tr class="empty"><td colspan="18">циклов пока нет</td></tr>'; return; }
+  tbody.innerHTML = app.cycles.map((c) => {
+    const closeTime = c.closed_ts ? ts(c.closed_ts) : '<span class="muted">открыт</span>';
+    const span = (c.closed_ts || Date.now()) - (c.opened_ts || 0);
+    return `<tr><td title="${escapeHtml(c.id)}">${escapeHtml(c.id)}</td><td>${escapeHtml(c.side || '')}</td>
+      <td>${ts(c.opened_ts)}</td><td>${closeTime}</td><td>${duration(span)}</td>
+      <td>${fmt(c.positions_count, 0)}</td><td>${fmt(c.avg_entry, 2)}</td><td>${fmt(c.target, 2)}</td>
+      <td>${fmt(c.close_price, 2)}</td><td>${fmt(c.volume_usd, 2)}</td><td>${fmt(c.fees, 4)}</td>
+      <td>${money(-Math.abs(Number(c.max_adverse_pnl_usd || 0)), 2)} / ${pct(-Math.abs(Number(c.max_adverse_pnl_pct || 0)), 2)}</td>
+      <td>${fmt(c.peak_notional_usd, 2)}</td><td>${fmt(c.peak_margin_usd, 2)}</td>
+      <td>${pct(c.max_deposit_load_pct, 2)}</td>
+      <td class="${cls(c.pnl)}"><b>${money(c.pnl, 4)}</b></td>
+      <td class="${cls(c.pnl_pct)}">${pct(c.pnl_pct)}</td><td class="muted">${escapeHtml(c.close_reason || '')}</td></tr>`;
+  }).join('');
 }
 
 function renderTrades() {
   const tbody = $('tradesTable').querySelector('tbody');
-  if (!app.trades.length) { tbody.innerHTML = '<tr class="empty"><td colspan="9">сделок пока нет</td></tr>'; return; }
-  tbody.innerHTML = app.trades.map((p) => `<tr>
-    <td>${p.cycle_id}</td><td><b>${p.idx}</b></td><td>${ts(p.ts)}</td><td>${fmt(p.price, 2)}</td>
-    <td>${fmt(p.volume_usd, 2)}</td><td>${p.qty}</td>
-    <td>${p.multiplier && p.multiplier > 1 ? 'x' + p.multiplier : 'x1'}</td>
-    <td>${p.close_price ? fmt(p.close_price, 2) : '<span class="muted">открыта</span>'}</td>
-    <td class="${cls(p.pnl)}">${p.close_ts ? money(p.pnl, 4) : '—'}</td></tr>`).join('');
+  if (!app.trades.length) { tbody.innerHTML = '<tr class="empty"><td colspan="15">сделок пока нет</td></tr>'; return; }
+  const now = Date.now();
+  tbody.innerHTML = app.trades.map((p) => {
+    const closed = Boolean(p.close_ts && p.close_price);
+    const fees = Number(p.fee || 0) + Number(p.close_fee || 0);
+    const pnlPct = p.volume_usd ? Number(p.pnl || 0) / p.volume_usd * 100 : 0;
+    return `<tr><td>${escapeHtml(p.cycle_id || '')}</td><td><b>${p.idx}</b></td><td>${escapeHtml(p.side || '')}</td>
+      <td>${ts(p.ts)}</td><td>${closed ? ts(p.close_ts) : '<span class="muted">открыта</span>'}</td>
+      <td>${duration((closed ? p.close_ts : now) - p.ts)}</td><td>${fmt(p.price, 2)}</td>
+      <td>${closed ? fmt(p.close_price, 2) : '—'}</td><td>${fmt(p.volume_usd, 2)}</td>
+      <td>${closed ? fmt(Number(p.close_price) * Number(p.qty), 2) : '—'}</td><td>${fmt(p.qty, 8)}</td>
+      <td>${p.multiplier && p.multiplier > 1 ? 'x' + p.multiplier : 'x1'}</td><td>${fmt(fees, 4)}</td>
+      <td class="${cls(p.pnl)}">${closed ? money(p.pnl, 4) : '—'}</td>
+      <td class="${cls(p.pnl)}">${closed ? pct(pnlPct, 3) : '—'}</td></tr>`;
+  }).join('');
 }
 
 function exportCyclesCsv() {
-  const head = ['id', 'side', 'positions', 'avg_entry', 'target', 'close_price', 'volume_usd', 'pnl', 'pnl_pct', 'reason'];
-  const rows = app.cycles.map((c) => [c.id, c.side, c.positions_count, c.avg_entry, c.target, c.close_price,
-    c.volume_usd, c.pnl, c.pnl_pct, c.close_reason]);
+  const head = ['id', 'side', 'opened_ts', 'closed_ts', 'duration_ms', 'positions', 'avg_entry', 'target',
+    'close_price', 'volume_usd', 'max_adverse_pnl_usd', 'max_adverse_pnl_pct', 'peak_notional_usd',
+    'peak_margin_usd', 'max_deposit_load_pct', 'pnl', 'pnl_pct', 'fees', 'reason'];
+  const rows = app.cycles.map((c) => [c.id, c.side, c.opened_ts, c.closed_ts,
+    c.closed_ts ? c.closed_ts - c.opened_ts : '', c.positions_count, c.avg_entry, c.target, c.close_price,
+    c.volume_usd, c.max_adverse_pnl_usd, c.max_adverse_pnl_pct, c.peak_notional_usd,
+    c.peak_margin_usd, c.max_deposit_load_pct, c.pnl, c.pnl_pct, c.fees, c.close_reason]);
   const csv = [head, ...rows].map((r) => r.map((v) => `"${v ?? ''}"`).join(';')).join('\n');
   const blob = new Blob(['\ufeff' + csv], { type: 'text/csv;charset=utf-8' });
   const a = document.createElement('a');
@@ -1136,7 +1179,9 @@ function renderBacktestResult(r) {
     ['Циклов', r.cycles, `прибыльных ${r.wins} · убыточных ${r.losses}`],
     ['Win rate', fmt(r.win_rate, 1) + ' %', `средний цикл ${money(r.avg_cycle_pnl, 4)}`],
     ['Максимум позиций', r.max_positions_used, `возможных ${(app.settings && app.settings.max_positions) || '—'}`],
-    ['Макс. просадка', fmt(r.max_drawdown, 4) + ' $', pct(r.max_drawdown_pct)],
+    ['Макс. просадка', fmt(r.max_drawdown, 4) + ' $', `${pct(r.max_drawdown_pct)} · close-to-close equity`],
+    ['Пиковая экспозиция', fmt(r.peak_notional_exposure, 2) + ' $', 'номинал открытых позиций'],
+    ['Пик маржи / нагрузка', fmt(r.max_margin_used_estimate, 2) + ' $', `${pct(r.max_deposit_load_pct)} · ${r.margin_method || ''}`],
     ['Лучший цикл', money(r.best_cycle, 4), `худший ${money(r.worst_cycle, 4)}`],
     ['Прибыль/убыток', r.profit_factor === null ? '∞' : fmt(r.profit_factor, 2), `комиссии ${fmt(r.fees_total, 4)} $`],
   ];
@@ -1167,13 +1212,29 @@ function renderBacktestResult(r) {
   const tbody = $('btCycles').querySelector('tbody');
   const list = (r.cycles_list || []).slice().reverse();
   tbody.innerHTML = list.length ? list.map((c, i) => `<tr>
-    <td>${i + 1}</td><td>${c.side}</td><td>${c.positions}</td><td>${fmt(c.avg_entry, 2)}</td>
-    <td>${fmt(c.target, 2)}</td><td>${fmt(c.close_price, 2)}</td><td>${fmt(c.volume_usd, 2)}</td>
+    <td>${i + 1}</td><td>${escapeHtml(c.side || '')}</td><td>${ts(c.opened_ts)}</td><td>${ts(c.closed_ts)}</td>
+    <td>${duration(c.duration_ms)}</td><td>${fmt(c.positions, 0)}</td><td>${fmt(c.avg_entry, 2)}</td>
+    <td>${fmt(c.target, 2)}</td><td>${fmt(c.close_price, 2)}</td><td>${fmt(c.volume_usd, 2)}</td><td>${fmt(c.fees, 4)}</td>
+    <td>${money(-Math.abs(Number(c.max_adverse_pnl_usd || 0)), 2)} / ${pct(-Math.abs(Number(c.max_adverse_pnl_pct || 0)), 2)}</td>
+    <td>${fmt(c.peak_notional_usd, 2)}</td><td>${fmt(c.peak_margin_usd, 2)}</td>
+    <td>${pct(c.max_deposit_load_pct, 2)}</td>
     <td class="${cls(c.pnl)}"><b>${money(c.pnl, 4)}</b></td><td class="${cls(c.pnl_pct)}">${pct(c.pnl_pct)}</td>
-    <td class="muted">${c.reason || ''}</td></tr>`).join('')
-    : '<tr class="empty"><td colspan="10">циклов не было — попробуйте уменьшить мин. движение или взять больше свечей</td></tr>';
+    <td class="muted">${escapeHtml(c.reason || '')}</td></tr>`).join('')
+    : '<tr class="empty"><td colspan="18">циклов не было — попробуйте уменьшить мин. движение или взять больше свечей</td></tr>';
+
+  const positionsBody = $('btPositions').querySelector('tbody');
+  const positions = (r.positions_list || []).slice().reverse();
+  positionsBody.innerHTML = positions.length ? positions.map((p) => `<tr>
+    <td>${escapeHtml(p.cycle_id || '')}</td><td><b>${p.idx}</b></td><td>${escapeHtml(p.side || '')}</td>
+    <td>${ts(p.ts)}</td><td>${ts(p.close_ts)}</td><td>${duration(p.duration_ms)}</td>
+    <td>${fmt(p.price, 2)}</td><td>${fmt(p.close_price, 2)}</td><td>${fmt(p.volume_usd, 2)}</td>
+    <td>${fmt(p.close_volume_usd, 2)}</td><td>${fmt(p.qty, 8)}</td>
+    <td>${p.multiplier > 1 ? `x${p.multiplier}` : 'x1'}</td><td>${fmt(p.fees, 4)}</td>
+    <td class="${cls(p.pnl)}">${money(p.pnl, 4)}</td><td class="${cls(p.pnl_pct)}">${pct(p.pnl_pct, 3)}</td></tr>`).join('')
+    : '<tr class="empty"><td colspan="15">позиций в бэктесте нет</td></tr>';
 
   renderEquityCurve(r.equity_curve || []);
+  renderDepositLoadCurve(r.equity_curve || []);
   renderBtChart(r.trades || []);
 }
 
@@ -1201,6 +1262,34 @@ function renderEquityCurve(curve) {
   data.sort((a, b) => a.time - b.time);
   app.btEquitySeries.setData(data);
   app.btEquity.timeScale().fitContent();
+}
+
+function renderDepositLoadCurve(curve) {
+  const container = $('btLoad');
+  if (!container || !window.LightweightCharts) return;
+  const LWC = window.LightweightCharts;
+  if (!app.btLoad) {
+    app.btLoad = LWC.createChart(container, {
+      layout: { background: { type: 'solid', color: '#0b1017' }, textColor: '#c6d2df', fontSize: 11 },
+      grid: { vertLines: { color: '#131b25' }, horzLines: { color: '#131b25' } },
+      rightPriceScale: { borderColor: '#243146' },
+      timeScale: { borderColor: '#243146', timeVisible: true, secondsVisible: false },
+    });
+    app.btLoadSeries = app.btLoad.addLineSeries({ color: '#f0b90b', lineWidth: 2, priceLineVisible: false });
+    new ResizeObserver(() => app.btLoad && app.btLoad.applyOptions({
+      width: container.clientWidth, height: container.clientHeight })).observe(container);
+  }
+  const seen = new Set();
+  const data = [];
+  curve.forEach((point) => {
+    const time = Math.floor(point.ts / 1000);
+    if (seen.has(time) || point.deposit_load_pct === undefined) return;
+    seen.add(time);
+    data.push({ time, value: Number(point.deposit_load_pct) || 0 });
+  });
+  data.sort((a, b) => a.time - b.time);
+  app.btLoadSeries.setData(data);
+  app.btLoad.timeScale().fitContent();
 }
 
 function renderBtChart(trades) {

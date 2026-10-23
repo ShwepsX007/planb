@@ -38,6 +38,14 @@ def test_backtest_runs_over_synthetic_history():
     assert result["max_positions_used"] <= settings.max_positions
     assert result["equity_curve"]
     assert result["trades"]
+    assert result["positions_list"]
+    assert result["max_drawdown"] >= 0
+    assert result["max_margin_used_estimate"] >= 0
+    assert result["peak_notional_exposure"] >= result["max_margin_used_estimate"]
+    assert "deposit_load_pct" in result["equity_curve"][0]
+    assert all("max_adverse_pnl_usd" in c and "position_details" in c
+               for c in result["cycles_list"])
+    assert all(p["close_ts"] and p["close_price"] for p in result["positions_list"])
     # fees are accounted for
     assert result["fees_total"] > 0
     # sum of cycle pnl equals the reported total
